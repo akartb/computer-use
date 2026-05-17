@@ -1,0 +1,9 @@
+{
+    "mcpServers": {
+        "computer-use": {
+            "command": "python",
+            "args": ["-m", "src.mcp_server"],
+            "cwd": "D:/AI/computer use"
+        }
+    }
+}

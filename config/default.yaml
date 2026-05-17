@@ -1,0 +1,52 @@
+core:
+  max_iterations: 50
+  action_delay: 0.5
+  screenshot_quality: 85
+  screenshot_format: "png"
+
+ai:
+  default_backend: "openai"
+  backends:
+    openai:
+      model: "computer-use-preview"
+      api_key_env: "OPENAI_API_KEY"
+      temperature: 0.0
+    anthropic:
+      model: "claude-sonnet-4-20250514"
+      api_key_env: "ANTHROPIC_API_KEY"
+      temperature: 0.0
+    ollama:
+      model: "llama3.2-vision"
+      base_url: "http://localhost:11434"
+
+safety:
+  enabled: true
+  mode: "confirm"
+  blocked_apps:
+    - "Task Manager"
+    - "Registry Editor"
+    - "System Preferences"
+  blocked_keywords:
+    - "delete"
+    - "format"
+    - "remove"
+  confidence_threshold: 0.7
+  require_confirmation_for:
+    - "type"
+    - "key_press"
+
+screen:
+  capture_method: "mss"
+  monitor: 0
+  dpi_aware: true
+
+input:
+  backend: "pyautogui"
+  typing_interval: 0.02
+  move_duration: 0.3
+
+logging:
+  level: "INFO"
+  save_screenshots: true
+  screenshot_dir: "./logs/screenshots"
+  action_log: "./logs/actions.jsonl"
