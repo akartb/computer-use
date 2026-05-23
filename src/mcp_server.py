@@ -1,8 +1,16 @@
 """
-MCP Server for Computer Use Plugin — Claude Desktop integration.
+MCP Server — Computer Use for Claude Desktop.
 
-Provides computer control tools via the Model Context Protocol.
-Every actionable tool takes (x,y) coordinates for pixel-perfect targeting.
+Fully model-agnostic. Works with ANY vision-capable model via OpenAI-compatible API:
+- OpenAI (GPT-4o), Ollama (llama3.2-vision, qwen-vl), vLLM, Groq, etc.
+
+The model receives a screenshot + system prompt and returns a JSON action
+with pixel coordinates. This server executes the action and loops.
+
+Configure via environment variables or .env file:
+  COMPUTER_USE_MODEL     - model name (default: gpt-4o)
+  COMPUTER_USE_API_KEY   - API key
+  COMPUTER_USE_BASE_URL  - API base URL (default: https://api.openai.com/v1)
 """
 
 from __future__ import annotations
@@ -10,10 +18,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import logging
+import os
+import re
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
@@ -23,21 +35,82 @@ from PIL import Image, ImageChops
 
 logger = logging.getLogger("computer-use-mcp")
 
+# ═════════════════════════════════════════════════════════════
+#  Config — model-agnostic
+# ═════════════════════════════════════════════════════════════
 
-# ════════════════════════════════════════
+def _load_config() -> dict:
+    """Load configuration from env vars or .env file."""
+    cfg: dict[str, str] = {}
+
+    # Read .env file
+    env_path = Path(__file__).parent.parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").readlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                v = v.strip().strip('"').strip("'")
+                if k.strip() not in os.environ:
+                    cfg[k.strip()] = v
+
+    # Environment overrides
+    for k in os.environ:
+        cfg[k] = os.environ[k]
+
+    return cfg
+
+_config = _load_config()
+
+# Model backends — OpenAI-compatible
+_AI_MODEL = _config.get("COMPUTER_USE_MODEL", "gpt-4o")
+_AI_API_KEY = _config.get("COMPUTER_USE_API_KEY", _config.get("OPENAI_API_KEY", ""))
+_AI_BASE_URL = _config.get("COMPUTER_USE_BASE_URL", _config.get("OPENAI_BASE_URL", "https://api.openai.com/v1"))
+
+
+# ═════════════════════════════════════════════════════════════
+#  System prompt — tells any vision model how to output actions
+# ═════════════════════════════════════════════════════════════
+
+_SYSTEM_PROMPT = """You are a computer use agent. You control a computer by looking at screenshots and deciding where to click and what to type.
+
+When you see a screenshot, decide the NEXT SINGLE ACTION to advance the task. Output ONLY a JSON object with no additional text, no markdown, no explanation.
+
+Available actions:
+
+1. Click: {"action": "click", "x": <int>, "y": <int>, "button": "left"}
+2. Double-click: {"action": "double_click", "x": <int>, "y": <int>}
+3. Type text: {"action": "type", "text": "<string>"}
+4. Press a key: {"action": "key", "keys": "<key>"}  (e.g. "enter", "tab", "ctrl+v", "ctrl+l")
+5. Scroll: {"action": "scroll", "x": <int>, "y": <int>, "direction": "up|down", "amount": <int>}
+6. Drag: {"action": "drag", "start_x": <int>, "start_y": <int>, "end_x": <int>, "end_y": <int>}
+7. Wait: {"action": "wait", "duration": <float>}
+8. Done: {"action": "done", "summary": "<what was accomplished>"}
+
+COORDINATES: (0,0) is the top-left corner of the screen. X increases to the right, Y increases down. Be PRECISE with pixel coordinates — look carefully at where UI elements are positioned.
+
+TASK FLOW:
+- For opening an app: click on the desktop/taskbar icon, or press Win key and type the app name
+- For browser navigation: click the address bar, type the URL, press Enter
+- For search: click the search box, type the query, press Enter
+- For forms: click each field, type the value
+- Each step: ONE action at a time. Wait for the UI to respond before the next action.
+
+OUTPUT ONLY THE JSON. NO OTHER TEXT."""
+
+
+# ═════════════════════════════════════════════════════════════
 #  Virtual Cursor
-# ════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 class VirtualCursor:
-    """Transparent overlay showing a red arrow at the AI's target position."""
+    """Transparent overlay — red arrow at the AI's cursor position."""
 
     def __init__(self):
         self._root: Any = None; self._canvas: Any = None
-        self._thread: threading.Thread | None = None
-        self._running = False
-        self._x: float = 0; self._y: float = 0
-        self._tx: float = 0; self._ty: float = 0
-        self._sw: int = 1920; self._sh: int = 1080
+        self._thread: threading.Thread | None = None; self._running = False
+        self._x = 0.0; self._y = 0.0; self._tx = 0.0; self._ty = 0.0
+        self._sw = 1920; self._sh = 1080
         self._cursor_items: list = []; self._ripple_items: list = []
         self._label_id: Any = None; self._status_id: Any = None
 
@@ -45,8 +118,7 @@ class VirtualCursor:
         if self._running: return
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        time.sleep(0.4)
+        self._thread.start(); time.sleep(0.4)
 
     def stop(self):
         self._running = False
@@ -54,12 +126,10 @@ class VirtualCursor:
             try: self._root.after(0, self._root.destroy)
             except Exception: pass
 
-    def show_click(self, x, y, label=""):
+    def show_at(self, x, y, label=""):
         self._tx, self._ty = x, y
-        if self._root: self._root.after(5, lambda: self._draw_ripple(x, y, label))
-
-    def show_type(self, text):
-        if self._root: self._root.after(5, lambda: self._show_label(f'Typing: "{text[:40]}"'))
+        if label and self._root:
+            self._root.after(5, lambda: self._draw_ripple(x, y, label))
 
     def set_status(self, text):
         if self._root: self._root.after(5, lambda: self._draw_status(text))
@@ -67,23 +137,18 @@ class VirtualCursor:
     def _run(self):
         import tkinter as tk
         self._root = tk.Tk(); self._root.withdraw()
-        self._sw = self._root.winfo_screenwidth()
-        self._sh = self._root.winfo_screenheight()
+        self._sw = self._root.winfo_screenwidth(); self._sh = self._root.winfo_screenheight()
         self._root = tk.Toplevel(self._root)
-        self._root.title("ComputerUse-Cursor")
-        self._root.attributes("-topmost", True)
-        self._root.attributes("-transparentcolor", "#F0F0F0")
-        self._root.overrideredirect(True)
+        self._root.title("ComputerUse"); self._root.attributes("-topmost", True)
+        self._root.attributes("-transparentcolor", "#F0F0F0"); self._root.overrideredirect(True)
         self._root.geometry(f"{self._sw}x{self._sh}+0+0")
         try: self._root.attributes("-alpha", 0.80)
         except Exception: pass
         self._canvas = tk.Canvas(self._root, width=self._sw, height=self._sh,
                                  bg="#F0F0F0", highlightthickness=0, bd=0)
         self._canvas.pack(fill="both", expand=True)
-        self._draw_cursor()
-        self._root.after(50, self._animate)
-        self._root.protocol("WM_DELETE_WINDOW", lambda: None)
-        self._root.mainloop()
+        self._draw_cursor(); self._root.after(50, self._animate)
+        self._root.protocol("WM_DELETE_WINDOW", lambda: None); self._root.mainloop()
 
     def _draw_cursor(self):
         x, y, s = self._x, self._y, 24
@@ -91,15 +156,15 @@ class VirtualCursor:
             x, y, x, y+s, x+s*0.3, y+s*0.7, x+s*0.6, y+s*1.2, x+s*0.75, y+s,
             x+s*0.45, y+s*0.6, x+s, y+s*0.5, fill="#FF2222", outline="#FFF", width=3))
         self._label_id = self._canvas.create_text(x+s+8, y, text="", fill="#FFD700",
-                                                    font=("Consolas", 10, "bold"), anchor="w")
+                                                   font=("Consolas",10,"bold"), anchor="w")
         self._status_id = self._canvas.create_text(10, self._sh-30, text="",
-                                                    fill="#00FF88", font=("Consolas", 11, "bold"), anchor="w")
+                                                    fill="#00FF88", font=("Consolas",11,"bold"), anchor="w")
 
     def _animate(self):
         if not self._running: return
         dx, dy = self._tx - self._x, self._ty - self._y
         if abs(dx) > 0.3 or abs(dy) > 0.3:
-            self._x += dx * 0.35; self._y += dy * 0.35
+            self._x += dx*0.35; self._y += dy*0.35
             for i in self._cursor_items: self._canvas.delete(i)
             self._cursor_items.clear()
             x, y, s = self._x, self._y, 24
@@ -111,8 +176,8 @@ class VirtualCursor:
 
     def _draw_ripple(self, x, y, label):
         self._show_label(label)
-        for r in [8, 16, 24, 32]:
-            self._ripple_items.append(self._canvas.create_oval(x-r, y-r, x+r, y+r, outline="#FF2222", width=3))
+        for r in [8,16,24,32]:
+            self._ripple_items.append(self._canvas.create_oval(x-r,y-r,x+r,y+r,outline="#FF2222",width=3))
         self._root.after(400, self._clear_ripples)
 
     def _clear_ripples(self):
@@ -130,12 +195,11 @@ class VirtualCursor:
         if self._status_id: self._canvas.itemconfig(self._status_id, text=f"[AI] {text}")
 
 
-# ════════════════════════════════════════
-#  Screenshot + Diff
-# ════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
+#  Screen capture
+# ═════════════════════════════════════════════════════════════
 
 _cursor: VirtualCursor | None = None
-
 def _get_cursor():
     global _cursor
     if _cursor is None: _cursor = VirtualCursor(); _cursor.start()
@@ -149,146 +213,226 @@ def _capture_raw(monitor=0):
         raw = sct.grab(mons[monitor])
         img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
         buf = io.BytesIO(); img.save(buf, format="PNG")
-        return img, base64.b64encode(buf.getvalue()).decode("utf-8")
-
-def _compute_diff(before, after):
-    if before.size != after.size: return 1.0
-    diff = ImageChops.difference(before, after)
-    if diff.getbbox() is None: return 0.0
-    try: data = list(diff.get_flattened_data())
-    except AttributeError: data = list(diff.getdata())
-    total = len(data)
-    if total == 0: return 0.0
-    return sum(1 for r, g, b in data if r > 12 or g > 12 or b > 12) / total
-
-def _action_with_feedback(fn, *args, **kw) -> dict:
-    before_img, _ = _capture_raw(0)
-    r = fn(*args, **kw)
-    time.sleep(0.5)
-    after_img, after_b64 = _capture_raw(0)
-    ratio = _compute_diff(before_img, after_img)
-    changed = ratio > 0.001
-    return {**r, "after_screenshot": after_b64, "changed": changed,
-            "change_ratio": round(ratio * 100, 3)}
-
-
-# ════════════════════════════════════════
-#  Actions
-# ════════════════════════════════════════
+        return img, base64.b64encode(buf.getvalue()).decode("utf-8"), img.size
 
 def _screenshot(monitor=0):
-    _, b64 = _capture_raw(monitor)
-    w, h = Image.open(io.BytesIO(base64.b64decode(b64))).size
+    _, b64, (w, h) = _capture_raw(monitor)
     return {"data": b64, "width": w, "height": h}
 
-def _screen_size():
-    import pyautogui; w, h = pyautogui.size(); return {"width": w, "height": h}
 
-def _get_display_info():
-    import mss; ds = []
-    with mss.mss() as sct:
-        for i, m in enumerate(sct.monitors[1:], start=0):
-            ds.append({"index": i, "width": m["width"], "height": m["height"],
-                       "x": m["left"], "y": m["top"], "is_primary": i == 0})
-    return ds
-
-def _mouse_pos():
-    import pyautogui; p = pyautogui.position(); return {"x": p.x, "y": p.y}
+# ═════════════════════════════════════════════════════════════
+#  Action execution
+# ═════════════════════════════════════════════════════════════
 
 def _click(x, y, button="left", clicks=1):
     import pyautogui
     pyautogui.FAILSAFE = True
-    c = _get_cursor()
-    c.show_click(x, y, f"{'Double-' if clicks==2 else ''}{button.title()}")
-    time.sleep(0.12)
-    pyautogui.moveTo(x, y, duration=0.3)
+    _get_cursor().show_at(x, y, f"{'Double-' if clicks==2 else ''}Click")
+    time.sleep(0.1); pyautogui.moveTo(x, y, duration=0.3)
     pyautogui.click(x=x, y=y, button=button, clicks=clicks)
-    return {"success": True, "action": "click", "x": x, "y": y}
 
-def _click_and_type(x, y, text, press_enter=True, clicks=1):
-    """Click at (x,y) to set focus, then type text, then optionally press Enter.
-    ALL in one call — ensures text goes to the right window."""
+def _type(text):
     import pyautogui
     pyautogui.FAILSAFE = True
-    c = _get_cursor()
-
-    # 1. Move cursor and click to set focus
-    c.show_click(x, y, f"Click -> Type")
-    time.sleep(0.15)
-    pyautogui.moveTo(x, y, duration=0.3)
-    pyautogui.click(x=x, y=y, button="left", clicks=clicks)
-    time.sleep(0.5)  # wait for focus shift
-
-    # 2. Type text
-    has_non_ascii = any(ord(ch) > 127 for ch in text)
-    c.show_type(text)
-
-    if has_non_ascii:
-        import pyperclip
-        pyperclip.copy(text)
-        time.sleep(0.1)
-        pyautogui.hotkey('ctrl', 'v')
-        time.sleep(0.2)
+    _get_cursor().set_status(f"Typing: {text[:30]}")
+    if any(ord(c) > 127 for c in text):
+        import pyperclip; pyperclip.copy(text); time.sleep(0.08)
+        pyautogui.hotkey('ctrl', 'v'); time.sleep(0.15)
     else:
         pyautogui.typewrite(text, interval=0.02)
 
-    # 3. Press Enter if requested
-    if press_enter:
-        time.sleep(0.15)
-        pyautogui.press('enter')
-
-    return {"success": True, "action": "click_and_type", "x": x, "y": y,
-            "text": text, "length": len(text),
-            "used_clipboard": has_non_ascii, "pressed_enter": press_enter}
-
-def _key_press(keys, x=None, y=None):
-    """Press a key/combo. If (x,y) given, clicks there first."""
+def _key(keys):
     import pyautogui
     pyautogui.FAILSAFE = True
-    if x is not None and y is not None:
-        c = _get_cursor(); c.show_click(x, y, f"Click -> {keys}")
-        time.sleep(0.15); pyautogui.moveTo(x, y, duration=0.3)
-        pyautogui.click(x=x, y=y, button="left", clicks=1)
-        time.sleep(0.4)
     parts = [k.strip() for k in keys.split("+")]
     if len(parts) == 1: pyautogui.press(parts[0])
     else: pyautogui.hotkey(*parts)
-    return {"success": True, "action": "key_press", "keys": parts}
 
 def _scroll(x, y, direction="down", amount=3):
     import pyautogui
     pyautogui.FAILSAFE = True
-    c = _get_cursor(); c.show_click(x, y, f"Scroll {direction}")
-    time.sleep(0.1); pyautogui.moveTo(x, y, duration=0.2)
+    _get_cursor().show_at(x, y, f"Scroll {direction}")
+    time.sleep(0.08); pyautogui.moveTo(x, y, duration=0.2)
     pyautogui.scroll(amount if direction == "down" else -amount, x=x, y=y)
-    return {"success": True, "action": "scroll", "x": x, "y": y}
 
 def _drag(sx, sy, ex, ey, duration=0.5):
     import pyautogui
     pyautogui.FAILSAFE = True
-    c = _get_cursor(); c.show_drag(sx, sy, ex, ey) if hasattr(c, 'show_drag') else None
-    time.sleep(0.1); pyautogui.moveTo(sx, sy, duration=0.3)
+    _get_cursor().show_at(sx, sy, "Drag start")
+    time.sleep(0.08); pyautogui.moveTo(sx, sy, duration=0.3)
     pyautogui.drag(ex-sx, ey-sy, duration=duration)
-    return {"success": True, "action": "drag"}
+    _get_cursor().show_at(ex, ey, "Drag end")
 
-def _wait(d=1.0):
-    time.sleep(d); return {"success": True}
+def _wait(secs): time.sleep(secs)
 
 def _open_app(name):
     mapping = {"edge": "start microsoft-edge:", "brave": "start brave",
                "chrome": "start chrome", "firefox": "start firefox",
                "notepad": "start notepad", "calc": "start calc"}
-    cmd = mapping.get(name.lower(), f"start {name}")
+    subprocess.Popen(mapping.get(name.lower(), f"start {name}"),
+                     shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ═════════════════════════════════════════════════════════════
+#  Model-agnostic AI call
+# ═════════════════════════════════════════════════════════════
+
+def _call_ai(messages: list) -> str | None:
+    """Send conversation to the configured model via OpenAI-compatible API."""
+    from openai import OpenAI
+
+    if not _AI_API_KEY:
+        return None
+
+    client = OpenAI(base_url=_AI_BASE_URL, api_key=_AI_API_KEY)
+
     try:
-        subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return {"success": True, "action": "open_app", "app": name}
+        response = client.chat.completions.create(
+            model=_AI_MODEL,
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.0,
+        )
+        return response.choices[0].message.content
     except Exception as e:
-        return {"success": False, "action": "open_app", "app": name, "error": str(e)}
+        logger.error("AI call failed: %s", e)
+        return None
 
 
-# ════════════════════════════════════════
+def _parse_action(raw: str) -> dict | None:
+    """Parse a model response into an action dict. Handles JSON in/out of markdown fences."""
+    raw = raw.strip()
+
+    # Strip markdown fences
+    m = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', raw)
+    if m: raw = m.group(1)
+
+    # Find first JSON object
+    m = re.search(r'\{[\s\S]*"action"[\s\S]*\}', raw)
+    if m: raw = m.group(0)
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+# ═════════════════════════════════════════════════════════════
+#  Autonomous task loop (model-agnostic)
+# ═════════════════════════════════════════════════════════════
+
+def _run_task(task: str, max_iterations: int = 30) -> dict:
+    """Run a task autonomously using system-prompt-driven Computer Use with any vision model."""
+    if not _AI_API_KEY:
+        return {"success": False, "error": "No API key configured.\n\n"
+                "Set one of these environment variables or add to .env:\n"
+                "  COMPUTER_USE_API_KEY=your-key\n"
+                "  COMPUTER_USE_MODEL=gpt-4o  (or any vision model)\n"
+                "  COMPUTER_USE_BASE_URL=https://api.openai.com/v1  (or Ollama: http://localhost:11434/v1)\n\n"
+                "Example for Ollama: COMPUTER_USE_MODEL=llama3.2-vision, COMPUTER_USE_BASE_URL=http://localhost:11434/v1, COMPUTER_USE_API_KEY=ollama"}
+
+    _get_cursor().set_status(f"Task: {task[:60]}")
+
+    # Get screen dimensions
+    _, b64, (w, h) = _capture_raw(0)
+    actions_log = []
+    last_b64 = b64
+
+    # Build message history
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "text", "text": f"Task: {task}\n\nScreen size: {w}x{h} pixels.\n\nHere is the first screenshot. What is the first action? Reply with ONLY the JSON action."},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]},
+    ]
+
+    for i in range(max_iterations):
+        _get_cursor().set_status(f"Iter {i+1}/{max_iterations}")
+
+        # Call the AI model
+        raw = _call_ai(messages)
+        if raw is None:
+            return {"success": False, "error": f"AI model returned nothing at iteration {i+1}. "
+                    f"Check your API key and model accessibility.",
+                    "actions": actions_log, "last_screenshot": last_b64}
+
+        action = _parse_action(raw)
+        if action is None:
+            # Model didn't return valid JSON — add a correction message
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": [{"type": "text",
+                             "text": "That was not valid JSON. Output ONLY a JSON object with an 'action' field. Example: {\"action\": \"click\", \"x\": 100, \"y\": 200}"}]})
+            continue
+
+        a = action.get("action", "")
+
+        # Check for done
+        if a == "done":
+            summary = action.get("summary", "Done")
+            return {"success": True, "summary": summary,
+                    "iterations": i + 1, "actions": actions_log,
+                    "last_screenshot": last_b64}
+
+        # Execute the action
+        desc = ""
+        try:
+            if a == "click":
+                _click(action.get("x", 0), action.get("y", 0),
+                       action.get("button", "left"), 1)
+                desc = f"Click ({action['x']},{action['y']})"
+            elif a == "double_click":
+                _click(action.get("x", 0), action.get("y", 0), "left", 2)
+                desc = f"Double-click ({action['x']},{action['y']})"
+            elif a == "type":
+                _type(action.get("text", ""))
+                desc = f"Type: '{action['text'][:30]}'"
+            elif a == "key":
+                _key(action.get("keys", ""))
+                desc = f"Key: {action['keys']}"
+            elif a == "scroll":
+                _scroll(action.get("x", 0), action.get("y", 0),
+                        action.get("direction", "down"), action.get("amount", 3))
+                desc = f"Scroll {action.get('direction','down')}"
+            elif a == "drag":
+                _drag(action.get("start_x", 0), action.get("start_y", 0),
+                      action.get("end_x", 0), action.get("end_y", 0),
+                      action.get("duration", 0.5))
+                desc = "Drag"
+            elif a == "wait":
+                _wait(min(action.get("duration", 1.0), 10.0))
+                desc = f"Wait {action.get('duration',1)}s"
+            else:
+                desc = f"Unknown action: {a}"
+            actions_log.append(desc)
+            logger.info("Step %d: %s", i+1, desc)
+        except Exception as e:
+            logger.error("Action failed: %s", e)
+            desc = f"Error: {e}"
+            actions_log.append(desc)
+
+        # Wait for UI, capture new screenshot
+        time.sleep(0.8)
+        _, b64, (w, h) = _capture_raw(0)
+        last_b64 = b64
+
+        # Add to conversation
+        messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": f"Here is the updated screen after '{desc}'. What is the next action? Output ONLY the JSON action."},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]})
+
+    _get_cursor().set_status("Max iterations reached")
+    return {"success": len(actions_log) > 0,
+            "summary": f"Reached max {max_iterations} iterations",
+            "iterations": len(actions_log), "actions": actions_log,
+            "last_screenshot": last_b64}
+
+
+# ═════════════════════════════════════════════════════════════
 #  MCP Server
-# ════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════
 
 app = Server("computer-use")
 
@@ -296,69 +440,76 @@ app = Server("computer-use")
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
+        Tool(name="run_task",
+             description="""Execute a task fully autonomously. Just describe what you want — the AI
+looks at screenshots, finds UI elements, clicks, types, and verifies automatically.
+Works with ANY vision model (GPT-4o, llama3.2-vision, qwen-vl, etc.).
+
+Example: run_task("Open Edge browser, go to douyin.com, search for 影视飓风, click the first video")
+
+Configure in .env:
+  COMPUTER_USE_MODEL=gpt-4o
+  COMPUTER_USE_API_KEY=your-key
+  COMPUTER_USE_BASE_URL=https://api.openai.com/v1""",
+             inputSchema={"type": "object",
+                          "properties": {
+                              "task": {"type": "string", "description": "Natural language task"},
+                              "max_iterations": {"type": "integer", "default": 30},
+                          }, "required": ["task"]}),
+
         Tool(name="screenshot",
-             description="Take a screenshot of the current screen. Returns the image. EXAMINE the image carefully, estimate pixel coordinates of UI elements you want to interact with, then use click_and_type with those coordinates.",
-             inputSchema={"type": "object", "properties": {"monitor": {"type": "integer", "default": 0}}}),
-
-        Tool(name="get_screen_size",
-             description="Get screen width and height in pixels.",
-             inputSchema={"type": "object", "properties": {}, "required": []}),
-
-        Tool(name="get_mouse_position",
-             description="Get current mouse (x,y) position.",
-             inputSchema={"type": "object", "properties": {}, "required": []}),
+             description="Capture the current screen.",
+             inputSchema={"type": "object",
+                          "properties": {"monitor": {"type": "integer", "default": 0}}}),
 
         Tool(name="click",
-             description="Click the left mouse button at (x,y). Returns after-screenshot + whether screen changed. Use this to give focus to a window or button — then follow up with click_and_type to type in it.",
+             description="Click at (x,y) coordinates.",
              inputSchema={"type": "object",
                           "properties": {"x": {"type": "integer"}, "y": {"type": "integer"},
-                                         "clicks": {"type": "integer", "enum": [1, 2], "default": 1}},
-                          "required": ["x", "y"]}),
+                                         "button": {"type": "string", "enum": ["left","right","middle"], "default": "left"},
+                                         "clicks": {"type": "integer", "enum": [1,2], "default": 1}},
+                          "required": ["x","y"]}),
 
         Tool(name="click_and_type",
-             description="THE MAIN TEXT INPUT TOOL. Click at (x,y) to focus, then type text, then press Enter. All in one call. ALWAYS use this instead of separate click+type — it ensures text reaches the right window. Supports Chinese/emoji via clipboard. Example: click_and_type(x=400, y=60, text='douyin.com')",
+             description="Click at (x,y) to focus, then type text, then press Enter.",
              inputSchema={"type": "object",
-                          "properties": {
-                              "x": {"type": "integer", "description": "X pixel coordinate of the text input field"},
-                              "y": {"type": "integer", "description": "Y pixel coordinate of the text input field"},
-                              "text": {"type": "string", "description": "Text to type (Chinese OK)"},
-                              "press_enter": {"type": "boolean", "default": True,
-                                              "description": "Press Enter after typing"},
-                              "clicks": {"type": "integer", "enum": [1, 2], "default": 1},
-                          }, "required": ["x", "y", "text"]}),
+                          "properties": {"x": {"type": "integer"}, "y": {"type": "integer"},
+                                         "text": {"type": "string"},
+                                         "press_enter": {"type": "boolean", "default": True}},
+                          "required": ["x","y","text"]}),
 
         Tool(name="key_press",
-             description="Press a key or combination like 'enter', 'ctrl+v', 'ctrl+l'. Provide (x,y) to click on the target window first so the key goes there.",
+             description="Press a key or combination like 'enter', 'ctrl+v'.",
              inputSchema={"type": "object",
-                          "properties": {
-                              "keys": {"type": "string", "description": "Key like 'enter', 'ctrl+v'"},
-                              "x": {"type": "integer"}, "y": {"type": "integer"},
-                          }, "required": ["keys"]}),
+                          "properties": {"keys": {"type": "string"},
+                                         "x": {"type": "integer"}, "y": {"type": "integer"}},
+                          "required": ["keys"]}),
 
         Tool(name="scroll",
              description="Scroll the mouse wheel at (x,y).",
              inputSchema={"type": "object",
                           "properties": {"x": {"type": "integer"}, "y": {"type": "integer"},
-                                         "direction": {"type": "string", "enum": ["up", "down"], "default": "down"},
+                                         "direction": {"type": "string", "enum": ["up","down"], "default": "down"},
                                          "amount": {"type": "integer", "default": 3}},
-                          "required": ["x", "y"]}),
+                          "required": ["x","y"]}),
 
         Tool(name="drag",
-             description="Drag from (start_x,start_y) to (end_x,end_y).",
+             description="Drag mouse from (sx,sy) to (ex,ey).",
              inputSchema={"type": "object",
-                          "properties": {"start_x": {"type": "integer"}, "start_y": {"type": "integer"},
-                                         "end_x": {"type": "integer"}, "end_y": {"type": "integer"},
-                                         "duration": {"type": "number", "default": 0.5}},
-                          "required": ["start_x", "start_y", "end_x", "end_y"]}),
+                          "properties": {"start_x":{"type":"integer"},"start_y":{"type":"integer"},
+                                         "end_x":{"type":"integer"},"end_y":{"type":"integer"},
+                                         "duration":{"type":"number","default":0.5}},
+                          "required": ["start_x","start_y","end_x","end_y"]}),
 
         Tool(name="wait",
-             description="Pause. Use between actions for UI to respond.",
-             inputSchema={"type": "object", "properties": {"duration": {"type": "number", "default": 1.0}}}),
+             description="Pause for N seconds.",
+             inputSchema={"type": "object",
+                          "properties": {"duration": {"type": "number", "default": 1.0}}}),
 
         Tool(name="open_app",
-             description="Open an application by name: edge, brave, chrome, firefox, notepad, calc. Returns a screenshot after the app opens.",
+             description="Open an app by name: edge, brave, chrome, firefox, notepad, calc.",
              inputSchema={"type": "object",
-                          "properties": {"name": {"type": "string", "description": "App name"}},
+                          "properties": {"name": {"type": "string"}},
                           "required": ["name"]}),
     ]
 
@@ -366,90 +517,84 @@ async def list_tools() -> list[Tool]:
 @app.call_tool()
 async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent | ImageContent]:
     try:
-        if name == "screenshot":
+        if name == "run_task":
+            task = args["task"]; max_it = args.get("max_iterations", 30)
+            _get_cursor().set_status(f"Running: {task[:50]}")
+            r = await asyncio.to_thread(_run_task, task, max_it)
+
+            if not r.get("success"):
+                return [TextContent(type="text", text=f"FAILED: {r.get('error','')}")]
+
+            summary = r.get("summary", "Done")
+            acts = r.get("actions", [])
+            lines = f"DONE: {summary}\n\nSteps ({r.get('iterations',0)}):\n" + \
+                    "\n".join(f"  {i+1}. {a}" for i,a in enumerate(acts))
+            return [TextContent(type="text", text=lines),
+                    ImageContent(type="image", data=r["last_screenshot"], mimeType="image/png")]
+
+        elif name == "screenshot":
             r = await asyncio.to_thread(_screenshot, args.get("monitor", 0))
-            return [
-                TextContent(type="text",
-                            text=f"Screen: {r['width']}x{r['height']}.\n"
-                                 "This is your current desktop. Look at the image carefully.\n"
-                                 f"Coordinates: top-left=(0,0), center=({r['width']//2},{r['height']//2}), "
-                                 f"bottom-right=({r['width']},{r['height']})."),
-                ImageContent(type="image", data=r["data"], mimeType="image/png")]
-
-        elif name == "get_screen_size":
-            r = await asyncio.to_thread(_screen_size)
-            return [TextContent(type="text", text=f"{r['width']}x{r['height']}")]
-
-        elif name == "get_mouse_position":
-            r = await asyncio.to_thread(_mouse_pos)
-            return [TextContent(type="text", text=f"({r['x']}, {r['y']})")]
+            return [TextContent(type="text",
+                                text=f"Screen: {r['width']}x{r['height']}. "
+                                     f"(0,0)→({r['width']},{r['height']})."),
+                    ImageContent(type="image", data=r["data"], mimeType="image/png")]
 
         elif name == "click":
-            r = await asyncio.to_thread(_action_with_feedback, _click,
-                                        args["x"], args["y"], "left", args.get("clicks", 1))
-            ch = "CHANGED" if r["changed"] else "NO CHANGE"
-            hint = "" if r["changed"] else " Click missed target — retry with adjusted coordinates."
-            return [TextContent(type="text", text=f"Click ({args['x']},{args['y']}): {ch} ({r['change_ratio']}%).{hint}"),
-                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
+            await asyncio.to_thread(_click, args["x"], args["y"],
+                                     args.get("button","left"), args.get("clicks",1))
+            time.sleep(0.4); ss = _screenshot(0)
+            _get_cursor().set_status(f"Click ({args['x']},{args['y']})")
+            return [TextContent(type="text", text=f"Clicked ({args['x']},{args['y']})."),
+                    ImageContent(type="image", data=ss["data"], mimeType="image/png")]
 
         elif name == "click_and_type":
-            r = await asyncio.to_thread(_action_with_feedback, _click_and_type,
-                                        args["x"], args["y"], args["text"],
-                                        args.get("press_enter", True), args.get("clicks", 1))
-            ch = "CHANGED" if r["changed"] else "NO CHANGE"
-            ent = "+Enter" if r.get("pressed_enter") else ""
-            clip = " (clipboard)" if r.get("used_clipboard") else ""
-            hint = "" if r["changed"] else " MISSED — check coordinates and retry."
-            return [TextContent(type="text",
-                                text=f"click_and_type ({args['x']},{args['y']}): "
-                                     f"'{args['text'][:50]}'{clip}{ent} -> {ch} ({r['change_ratio']}%).{hint}"),
-                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
+            await asyncio.to_thread(_click, args["x"], args["y"], "left", args.get("clicks",1))
+            time.sleep(0.5); await asyncio.to_thread(_type, args["text"])
+            if args.get("press_enter", True):
+                time.sleep(0.15); await asyncio.to_thread(_key, "enter")
+            time.sleep(0.4); ss = _screenshot(0)
+            _get_cursor().set_status(f"Typed at ({args['x']},{args['y']})")
+            return [TextContent(type="text", text=f"Click+Type at ({args['x']},{args['y']}): '{args['text'][:40]}'"),
+                    ImageContent(type="image", data=ss["data"], mimeType="image/png")]
 
         elif name == "key_press":
             kx, ky = args.get("x"), args.get("y")
-            r = await asyncio.to_thread(_action_with_feedback, _key_press, args["keys"], kx, ky)
-            ch = "CHANGED" if r["changed"] else "NO CHANGE"
-            ctx = f" (clicked ({kx},{ky}) first)" if kx is not None else ""
-            return [TextContent(type="text", text=f"Key {args['keys']}{ctx}: {ch} ({r['change_ratio']}%)."),
-                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
+            if kx is not None: await asyncio.to_thread(_click, kx, ky, "left", 1); time.sleep(0.4)
+            await asyncio.to_thread(_key, args["keys"])
+            time.sleep(0.4); ss = _screenshot(0)
+            return [TextContent(type="text", text=f"Key: {args['keys']}"),
+                    ImageContent(type="image", data=ss["data"], mimeType="image/png")]
 
         elif name == "scroll":
-            r = await asyncio.to_thread(_action_with_feedback, _scroll,
-                                        args["x"], args["y"],
-                                        args.get("direction", "down"), args.get("amount", 3))
-            ch = "CHANGED" if r["changed"] else "NO CHANGE"
-            return [TextContent(type="text", text=f"Scroll ({args['x']},{args['y']}): {ch} ({r['change_ratio']}%)."),
-                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
+            await asyncio.to_thread(_scroll, args["x"], args["y"],
+                                     args.get("direction","down"), args.get("amount",3))
+            time.sleep(0.3); ss = _screenshot(0)
+            return [TextContent(type="text", text=f"Scrolled ({args['x']},{args['y']})."),
+                    ImageContent(type="image", data=ss["data"], mimeType="image/png")]
 
         elif name == "drag":
-            r = await asyncio.to_thread(_action_with_feedback, _drag,
-                                        args["start_x"], args["start_y"],
-                                        args["end_x"], args["end_y"], args.get("duration", 0.5))
-            ch = "CHANGED" if r["changed"] else "NO CHANGE"
-            return [TextContent(type="text", text=f"Drag: {ch} ({r['change_ratio']}%)."),
-                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
+            await asyncio.to_thread(_drag, args["sx"], args["sy"],
+                                     args["ex"], args["ey"], args.get("duration",0.5))
+            time.sleep(0.3); ss = _screenshot(0)
+            return [TextContent(type="text", text="Dragged."),
+                    ImageContent(type="image", data=ss["data"], mimeType="image/png")]
 
         elif name == "wait":
-            await asyncio.to_thread(_wait, min(args.get("duration", 1.0), 10.0))
-            return [TextContent(type="text", text=f"Waited {args.get('duration', 1.0)}s")]
+            await asyncio.to_thread(_wait, min(args.get("duration",1.0), 10.0))
+            return [TextContent(type="text", text=f"Waited {args.get('duration',1)}s")]
 
         elif name == "open_app":
-            r = await asyncio.to_thread(_open_app, args["name"])
-            if r["success"]:
-                _wait(2.0)
-                ss = _screenshot(0)
-                _get_cursor().set_status(f"Opened {args['name']}")
-                return [TextContent(type="text",
-                                    text=f"Opened '{args['name']}'. Current screen below. "
-                                         "Now call screenshot() to see the app, then use click_and_type() to type."),
-                        ImageContent(type="image", data=ss["data"], mimeType="image/png")]
-            return [TextContent(type="text", text=f"FAILED to open '{args['name']}': {r.get('error')}")]
+            await asyncio.to_thread(_open_app, args["name"])
+            _wait(2.0); ss = _screenshot(0)
+            _get_cursor().set_status(f"Opened {args['name']}")
+            return [TextContent(type="text", text=f"Opened '{args['name']}'."),
+                    ImageContent(type="image", data=ss["data"], mimeType="image/png")]
 
         else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+            return [TextContent(type="text", text=f"Unknown: {name}")]
 
     except Exception as e:
-        logger.error("Tool '%s' failed: %s", name, e, exc_info=True)
+        logger.error("%s failed: %s", name, e, exc_info=True)
         return [TextContent(type="text", text=f"Error: {e}")]
 
 
