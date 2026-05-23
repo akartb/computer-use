@@ -31,6 +31,8 @@ Thumbs.db
 logs/
 recordings/
 test_output.txt
+test_*.png
+step_*.png
 
 # Config overrides
 config/local.yaml
