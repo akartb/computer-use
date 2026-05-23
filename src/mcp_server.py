@@ -341,25 +341,23 @@ def _mouse_move(x: int, y: int, duration: float = 0.35) -> dict:
 
 def _type_text(text: str, interval: float = 0.02,
                x: int | None = None, y: int | None = None,
-               clicks: int = 1) -> dict:
-    """Type text. If x,y given, clicks there first to establish focus.
-    Uses clipboard+Ctrl+V for non-ASCII text (Chinese, emoji, etc.).
-    """
+               clicks: int = 1, press_enter: bool = False) -> dict:
+    """Type text. If (x,y) given, clicks there first to establish focus.
+    Uses clipboard+Ctrl+V for non-ASCII text.
+    If press_enter=True, presses Enter after typing IN THE SAME CALL
+    (so the target window still has focus)."""
     import pyautogui
     pyautogui.FAILSAFE = True
     cursor = _get_cursor()
 
-    # Click first if coordinates given
     if x is not None and y is not None:
-        cursor.show_click(x, y, "Click → Type")
+        cursor.show_click(x, y, "Click -> Type")
         time.sleep(0.15)
         pyautogui.moveTo(x, y, duration=0.3)
         pyautogui.click(x=x, y=y, button="left", clicks=clicks)
-        time.sleep(0.4)  # wait for focus to shift
+        time.sleep(0.4)
 
-    # Determine if we need clipboard mode (non-ASCII text)
     has_non_ascii = any(ord(c) > 127 for c in text)
-
     cursor.show_type(text)
 
     if has_non_ascii:
@@ -371,13 +369,30 @@ def _type_text(text: str, interval: float = 0.02,
     else:
         pyautogui.typewrite(text, interval=interval)
 
+    if press_enter:
+        time.sleep(0.15)
+        pyautogui.press('enter')
+
     return {"success": True, "action": "type", "text": text,
-            "length": len(text), "used_clipboard": has_non_ascii}
+            "length": len(text), "used_clipboard": has_non_ascii,
+            "pressed_enter": press_enter}
 
 
-def _key_press(keys: str) -> dict:
+def _key_press(keys: str,
+               x: int | None = None, y: int | None = None) -> dict:
+    """Press a key/combo. If (x,y) given, clicks there first so the
+    key press goes to the right window (not Claude Desktop)."""
     import pyautogui
     pyautogui.FAILSAFE = True
+
+    if x is not None and y is not None:
+        cursor = _get_cursor()
+        cursor.show_click(x, y, f"Click -> {keys}")
+        time.sleep(0.15)
+        pyautogui.moveTo(x, y, duration=0.3)
+        pyautogui.click(x=x, y=y, button="left", clicks=1)
+        time.sleep(0.4)
+
     parts = [k.strip() for k in keys.split("+")]
     if len(parts) == 1:
         pyautogui.press(parts[0])
@@ -481,20 +496,25 @@ If changed=false, the click missed — adjust coordinates and retry.""",
              }, "required": ["x", "y"]}),
 
         Tool(name="type_text", description="""Type text. Uses clipboard+Ctrl+V for Chinese/emoji automatically.
-IMPORTANT: Provide (x,y) to CLICK ON the target input field FIRST — this ensures the text goes to the right window.
-After typing, captures a new screenshot and reports whether the screen changed.
-Example: type_text(text='你好世界', x=500, y=60) — clicks address bar then types.""",
+Provide (x,y) to CLICK on the target input field FIRST — this ensures the text goes to the right window.
+Set press_enter=true to submit the text (e.g. search, send message).
+After typing, returns a new screenshot and whether the screen changed.
+Example: type_text(text='你好', x=500, y=60, press_enter=true)""",
              inputSchema={"type": "object", "properties": {
                  "text": {"type": "string", "description": "Text to type (Chinese/emoji OK)"},
-                 "x": {"type": "integer", "description": "Click X before typing (to focus the target field)"},
+                 "x": {"type": "integer", "description": "Click X before typing (to focus target)"},
                  "y": {"type": "integer", "description": "Click Y before typing"},
                  "clicks": {"type": "integer", "enum": [1, 2], "default": 1},
+                 "press_enter": {"type": "boolean", "default": False, "description": "Press Enter after typing (in same call, focus preserved)"},
                  "interval": {"type": "number", "default": 0.02},
              }, "required": ["text"]}),
 
-        Tool(name="key_press", description="Press a key or combo (e.g. 'enter', 'ctrl+v'). Captures after-screenshot.",
+        Tool(name="key_press", description="""Press a key or combo. Provide (x,y) to click first so the key goes to the right window.
+Example: key_press(keys='enter', x=500, y=300) — clicks at (500,300) then presses Enter.""",
              inputSchema={"type": "object", "properties": {
-                 "keys": {"type": "string", "description": "Key or combo like 'enter', 'ctrl+v', 'alt+tab'"},
+                 "keys": {"type": "string", "description": "Key or combo like 'enter', 'ctrl+v'"},
+                 "x": {"type": "integer", "description": "Click X first (to focus target window)"},
+                 "y": {"type": "integer", "description": "Click Y first"},
              }, "required": ["keys"]}),
 
         Tool(name="scroll", description="Scroll at (x,y). Shows virtual cursor, captures after-screenshot with change detection.",
@@ -581,21 +601,28 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             cx = arguments.get("x")
             cy = arguments.get("y")
             cl = arguments.get("clicks", 1)
+            pe = arguments.get("press_enter", False)
             r = await asyncio.to_thread(_action_with_feedback, _type_text,
-                                        text, arguments.get("interval", 0.02), cx, cy, cl)
+                                        text, arguments.get("interval", 0.02),
+                                        cx, cy, cl, pe)
             ch = "YES" if r["changed"] else "NO"
-            clip = " (via clipboard)" if r.get("used_clipboard", False) else ""
+            clip = " (clipboard)" if r.get("used_clipboard", False) else ""
             ctx = f" (clicked ({cx},{cy}) first)" if cx is not None else ""
+            ent = " + Enter" if pe else ""
             return [
-                TextContent(type="text", text=f"Typed {len(text)} chars{clip}{ctx}. Changed: {ch} ({r['change_ratio']}%)"),
+                TextContent(type="text", text=f"Typed {len(text)} chars{clip}{ent}{ctx}. Changed: {ch} ({r['change_ratio']}%)"),
                 ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png"),
             ]
 
         elif name == "key_press":
-            r = await asyncio.to_thread(_action_with_feedback, _key_press, arguments["keys"])
+            kx = arguments.get("x")
+            ky = arguments.get("y")
+            r = await asyncio.to_thread(_action_with_feedback, _key_press,
+                                        arguments["keys"], kx, ky)
             ch = "YES" if r["changed"] else "NO"
+            ctx = f" (clicked ({kx},{ky}) first)" if kx is not None else ""
             return [
-                TextContent(type="text", text=f"Pressed {arguments['keys']}. Changed: {ch} ({r['change_ratio']}%)"),
+                TextContent(type="text", text=f"Pressed {arguments['keys']}{ctx}. Changed: {ch} ({r['change_ratio']}%)"),
                 ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png"),
             ]
 
