@@ -34,6 +34,7 @@ dependencies = [
     "uvicorn>=0.20",
     "websockets>=11.0",
     "mcp>=1.0",
+    "pyperclip>=1.8",
 ]
 
 [project.optional-dependencies]
@@ -53,6 +54,7 @@ server = [
     "uvicorn>=0.20",
     "websockets>=11.0",
     "mcp>=1.0",
+    "pyperclip>=1.8",
 ]
 
 [project.scripts]
