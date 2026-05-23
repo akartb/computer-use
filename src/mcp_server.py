@@ -1,20 +1,8 @@
 """
 MCP Server for Computer Use Plugin — Claude Desktop integration.
 
-Virtual cursor overlay + screenshot feedback loop.
-Every action tool captures before/after screenshots so Claude can
-visually verify the result and adjust if needed.
-
-Usage — add to claude_desktop_config.json:
-{
-    "mcpServers": {
-        "computer-use": {
-            "command": "python",
-            "args": ["-m", "src.mcp_server"],
-            "cwd": "<project-dir>"
-        }
-    }
-}
+Provides computer control tools via the Model Context Protocol.
+Every actionable tool takes (x,y) coordinates for pixel-perfect targeting.
 """
 
 from __future__ import annotations
@@ -24,7 +12,6 @@ import base64
 import io
 import logging
 import subprocess
-import sys
 import threading
 import time
 from typing import Any
@@ -37,33 +24,25 @@ from PIL import Image, ImageChops
 logger = logging.getLogger("computer-use-mcp")
 
 
-# ═══════════════════════════════════════════════════════════════
-#  Virtual Cursor Overlay
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
+#  Virtual Cursor
+# ════════════════════════════════════════
 
 class VirtualCursor:
-    """Transparent overlay showing a red arrow cursor at the target position."""
+    """Transparent overlay showing a red arrow at the AI's target position."""
 
     def __init__(self):
-        self._root: Any = None
-        self._canvas: Any = None
+        self._root: Any = None; self._canvas: Any = None
         self._thread: threading.Thread | None = None
         self._running = False
-        self._x: float = 0
-        self._y: float = 0
-        self._tx: float = 0
-        self._ty: float = 0
-        self._label: str = ""
-        self._sw: int = 1920
-        self._sh: int = 1080
-        self._cursor_items: list = []
-        self._ripple_items: list = []
-        self._label_id: Any = None
-        self._status_id: Any = None
+        self._x: float = 0; self._y: float = 0
+        self._tx: float = 0; self._ty: float = 0
+        self._sw: int = 1920; self._sh: int = 1080
+        self._cursor_items: list = []; self._ripple_items: list = []
+        self._label_id: Any = None; self._status_id: Any = None
 
     def start(self):
-        if self._running:
-            return
+        if self._running: return
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -72,41 +51,22 @@ class VirtualCursor:
     def stop(self):
         self._running = False
         if self._root:
-            try:
-                self._root.after(0, self._root.destroy)
-            except Exception:
-                pass
+            try: self._root.after(0, self._root.destroy)
+            except Exception: pass
 
     def show_click(self, x, y, label=""):
         self._tx, self._ty = x, y
-        self._label = label
-        if self._root:
-            self._root.after(5, lambda: self._draw_ripple(x, y, label))
+        if self._root: self._root.after(5, lambda: self._draw_ripple(x, y, label))
 
     def show_type(self, text):
-        if self._root:
-            s = text[:40]
-            self._root.after(5, lambda: self._show_label(f'Typing: "{s}"'))
-
-    def show_scroll(self, direction, amount):
-        a = "▲" if direction == "up" else "▼"
-        if self._root:
-            self._root.after(5, lambda: self._show_label(f"Scroll {a} x{amount}"))
-
-    def show_drag(self, sx, sy, ex, ey):
-        if self._root:
-            self._root.after(5, lambda: self._draw_drag_line(sx, sy, ex, ey))
+        if self._root: self._root.after(5, lambda: self._show_label(f'Typing: "{text[:40]}"'))
 
     def set_status(self, text):
-        if self._root:
-            self._root.after(5, lambda: self._draw_status(text))
-
-    # ── internals ──────────────────────────
+        if self._root: self._root.after(5, lambda: self._draw_status(text))
 
     def _run(self):
         import tkinter as tk
-        self._root = tk.Tk()
-        self._root.withdraw()
+        self._root = tk.Tk(); self._root.withdraw()
         self._sw = self._root.winfo_screenwidth()
         self._sh = self._root.winfo_screenheight()
         self._root = tk.Toplevel(self._root)
@@ -115,10 +75,8 @@ class VirtualCursor:
         self._root.attributes("-transparentcolor", "#F0F0F0")
         self._root.overrideredirect(True)
         self._root.geometry(f"{self._sw}x{self._sh}+0+0")
-        try:
-            self._root.attributes("-alpha", 0.80)
-        except Exception:
-            pass
+        try: self._root.attributes("-alpha", 0.80)
+        except Exception: pass
         self._canvas = tk.Canvas(self._root, width=self._sw, height=self._sh,
                                  bg="#F0F0F0", highlightthickness=0, bd=0)
         self._canvas.pack(fill="both", expand=True)
@@ -129,67 +87,39 @@ class VirtualCursor:
 
     def _draw_cursor(self):
         x, y, s = self._x, self._y, 24
-        self._cursor_items.append(
-            self._canvas.create_polygon(
-                x, y, x, y + s, x + s * 0.3, y + s * 0.7,
-                x + s * 0.6, y + s * 1.2, x + s * 0.75, y + s * 1.0,
-                x + s * 0.45, y + s * 0.6, x + s, y + s * 0.5,
-                fill="#FF2222", outline="#FFFFFF", width=3,
-            )
-        )
-        self._label_id = self._canvas.create_text(
-            x + s + 8, y, text="", fill="#FFD700", font=("Consolas", 10, "bold"), anchor="w",
-        )
-        self._status_id = self._canvas.create_text(
-            10, self._sh - 30, text="", fill="#00FF88", font=("Consolas", 11, "bold"), anchor="w",
-        )
-        self._draw_status("Computer Use Ready")
+        self._cursor_items.append(self._canvas.create_polygon(
+            x, y, x, y+s, x+s*0.3, y+s*0.7, x+s*0.6, y+s*1.2, x+s*0.75, y+s,
+            x+s*0.45, y+s*0.6, x+s, y+s*0.5, fill="#FF2222", outline="#FFF", width=3))
+        self._label_id = self._canvas.create_text(x+s+8, y, text="", fill="#FFD700",
+                                                    font=("Consolas", 10, "bold"), anchor="w")
+        self._status_id = self._canvas.create_text(10, self._sh-30, text="",
+                                                    fill="#00FF88", font=("Consolas", 11, "bold"), anchor="w")
 
     def _animate(self):
-        if not self._running:
-            return
-        dx = self._tx - self._x
-        dy = self._ty - self._y
+        if not self._running: return
+        dx, dy = self._tx - self._x, self._ty - self._y
         if abs(dx) > 0.3 or abs(dy) > 0.3:
-            self._x += dx * 0.35
-            self._y += dy * 0.35
-            for item in self._cursor_items:
-                self._canvas.delete(item)
+            self._x += dx * 0.35; self._y += dy * 0.35
+            for i in self._cursor_items: self._canvas.delete(i)
             self._cursor_items.clear()
             x, y, s = self._x, self._y, 24
-            self._cursor_items.append(
-                self._canvas.create_polygon(
-                    x, y, x, y + s, x + s * 0.3, y + s * 0.7,
-                    x + s * 0.6, y + s * 1.2, x + s * 0.75, y + s * 1.0,
-                    x + s * 0.45, y + s * 0.6, x + s, y + s * 0.5,
-                    fill="#FF2222", outline="#FFFFFF", width=3,
-                )
-            )
-            if self._label_id:
-                self._canvas.coords(self._label_id, x + s + 8, y)
-        if self._running and self._root:
-            self._root.after(16, self._animate)
+            self._cursor_items.append(self._canvas.create_polygon(
+                x, y, x, y+s, x+s*0.3, y+s*0.7, x+s*0.6, y+s*1.2, x+s*0.75, y+s,
+                x+s*0.45, y+s*0.6, x+s, y+s*0.5, fill="#FF2222", outline="#FFF", width=3))
+            if self._label_id: self._canvas.coords(self._label_id, x+s+8, y)
+        if self._running and self._root: self._root.after(16, self._animate)
 
     def _draw_ripple(self, x, y, label):
         self._show_label(label)
         for r in [8, 16, 24, 32]:
-            item = self._canvas.create_oval(x - r, y - r, x + r, y + r, outline="#FF2222", width=3)
-            self._ripple_items.append(item)
+            self._ripple_items.append(self._canvas.create_oval(x-r, y-r, x+r, y+r, outline="#FF2222", width=3))
         self._root.after(400, self._clear_ripples)
 
     def _clear_ripples(self):
-        for item in self._ripple_items:
-            try:
-                self._canvas.delete(item)
-            except Exception:
-                pass
+        for i in self._ripple_items:
+            try: self._canvas.delete(i)
+            except Exception: pass
         self._ripple_items.clear()
-
-    def _draw_drag_line(self, sx, sy, ex, ey):
-        self._show_label("Drag")
-        self._canvas.create_line(sx, sy, ex, ey, fill="#FF8800", width=3, dash=(4, 4), tags="drag")
-        self._canvas.create_oval(ex - 5, ey - 5, ex + 5, ey + 5, fill="#FF8800", tags="drag")
-        self._root.after(800, lambda: self._canvas.delete("drag"))
 
     def _show_label(self, text):
         if self._label_id:
@@ -197,168 +127,101 @@ class VirtualCursor:
             self._root.after(1500, lambda: self._canvas.itemconfig(self._label_id, text=""))
 
     def _draw_status(self, text):
-        if self._status_id:
-            self._canvas.itemconfig(self._status_id, text=f"[AI] {text}")
+        if self._status_id: self._canvas.itemconfig(self._status_id, text=f"[AI] {text}")
 
 
-# ═══════════════════════════════════════════════════════════════
-#  Screenshot + Change Detection
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
+#  Screenshot + Diff
+# ════════════════════════════════════════
 
 _cursor: VirtualCursor | None = None
 
-
-def _get_cursor() -> VirtualCursor:
+def _get_cursor():
     global _cursor
-    if _cursor is None:
-        _cursor = VirtualCursor()
-        _cursor.start()
+    if _cursor is None: _cursor = VirtualCursor(); _cursor.start()
     return _cursor
 
-
-def _capture_raw(monitor: int = 0) -> tuple[Image.Image, str]:
-    """Capture screen, return (PIL Image, base64 string)."""
+def _capture_raw(monitor=0):
     import mss
     with mss.mss() as sct:
-        monitors = sct.monitors
-        if monitor >= len(monitors):
-            monitor = 0
-        raw = sct.grab(monitors[monitor])
+        mons = sct.monitors
+        if monitor >= len(mons): monitor = 0
+        raw = sct.grab(mons[monitor])
         img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return img, b64
+        buf = io.BytesIO(); img.save(buf, format="PNG")
+        return img, base64.b64encode(buf.getvalue()).decode("utf-8")
 
+def _compute_diff(before, after):
+    if before.size != after.size: return 1.0
+    diff = ImageChops.difference(before, after)
+    if diff.getbbox() is None: return 0.0
+    try: data = list(diff.get_flattened_data())
+    except AttributeError: data = list(diff.getdata())
+    total = len(data)
+    if total == 0: return 0.0
+    return sum(1 for r, g, b in data if r > 12 or g > 12 or b > 12) / total
 
-def _compute_diff(before_img: Image.Image, after_img: Image.Image) -> float:
-    """Return pixel change ratio between two images (0.0 = identical, 1.0 = totally different)."""
-    if before_img.size != after_img.size:
-        return 1.0
-    diff = ImageChops.difference(before_img, after_img)
-    bbox = diff.getbbox()
-    if bbox is None:
-        return 0.0
-    try:
-        diff_data = list(diff.get_flattened_data())
-    except AttributeError:
-        diff_data = list(diff.getdata())
-    total = len(diff_data)
-    if total == 0:
-        return 0.0
-    changed = sum(1 for r, g, b in diff_data if r > 12 or g > 12 or b > 12)
-    return changed / total
-
-
-def _action_with_feedback(action_fn, *args, **kwargs) -> dict:
-    """
-    Execute an action, then capture an after-screenshot and detect changes.
-
-    Returns dict with:
-      - success, action, description
-      - after_screenshot (base64 PNG)
-      - changed (bool): whether the screen visibly changed
-      - change_ratio (float): percentage of pixels changed
-    """
-    before_img, before_b64 = _capture_raw(0)
-
-    # Execute the action
-    result = action_fn(*args, **kwargs)
-
-    # Wait briefly for UI to respond, then capture after
-    time.sleep(0.4)
+def _action_with_feedback(fn, *args, **kw) -> dict:
+    before_img, _ = _capture_raw(0)
+    r = fn(*args, **kw)
+    time.sleep(0.5)
     after_img, after_b64 = _capture_raw(0)
-
     ratio = _compute_diff(before_img, after_img)
-    changed = ratio > 0.001  # more than 0.1% pixels changed
-
-    return {
-        **result,
-        "after_screenshot": after_b64,
-        "before_screenshot": before_b64,
-        "changed": changed,
-        "change_ratio": round(ratio * 100, 3),
-    }
+    changed = ratio > 0.001
+    return {**r, "after_screenshot": after_b64, "changed": changed,
+            "change_ratio": round(ratio * 100, 3)}
 
 
-# ═══════════════════════════════════════════════════════════════
-#  Core actions
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
+#  Actions
+# ════════════════════════════════════════
 
-
-def _capture_screen(monitor: int = 0) -> dict:
+def _screenshot(monitor=0):
     _, b64 = _capture_raw(monitor)
-    from PIL import Image as PILImage
-    img = PILImage.open(io.BytesIO(base64.b64decode(b64)))
-    w, h = img.size
-    return {"data": b64, "width": w, "height": h, "monitor": monitor}
+    w, h = Image.open(io.BytesIO(base64.b64decode(b64))).size
+    return {"data": b64, "width": w, "height": h}
 
+def _screen_size():
+    import pyautogui; w, h = pyautogui.size(); return {"width": w, "height": h}
 
-def _screen_size() -> dict:
-    import pyautogui
-    w, h = pyautogui.size()
-    return {"width": w, "height": h}
-
-
-def _get_display_info() -> list[dict]:
-    import mss
-    displays = []
+def _get_display_info():
+    import mss; ds = []
     with mss.mss() as sct:
-        for i, mon in enumerate(sct.monitors[1:], start=0):
-            displays.append({
-                "index": i, "width": mon["width"], "height": mon["height"],
-                "x": mon["left"], "y": mon["top"], "is_primary": i == 0,
-            })
-    return displays
+        for i, m in enumerate(sct.monitors[1:], start=0):
+            ds.append({"index": i, "width": m["width"], "height": m["height"],
+                       "x": m["left"], "y": m["top"], "is_primary": i == 0})
+    return ds
 
+def _mouse_pos():
+    import pyautogui; p = pyautogui.position(); return {"x": p.x, "y": p.y}
 
-def _current_mouse_position() -> dict:
-    import pyautogui
-    pos = pyautogui.position()
-    return {"x": pos.x, "y": pos.y}
-
-
-def _mouse_click(x: int, y: int, button: str = "left", clicks: int = 1) -> dict:
+def _click(x, y, button="left", clicks=1):
     import pyautogui
     pyautogui.FAILSAFE = True
-    cursor = _get_cursor()
-    labels = {1: "Click", 2: "Double-click"}
-    cursor.show_click(x, y, f"{labels.get(clicks, 'Click')} ({button})")
+    c = _get_cursor()
+    c.show_click(x, y, f"{'Double-' if clicks==2 else ''}{button.title()}")
     time.sleep(0.12)
     pyautogui.moveTo(x, y, duration=0.3)
     pyautogui.click(x=x, y=y, button=button, clicks=clicks)
-    return {"success": True, "action": f"{button}_click", "x": x, "y": y, "clicks": clicks}
+    return {"success": True, "action": "click", "x": x, "y": y}
 
-
-def _mouse_move(x: int, y: int, duration: float = 0.35) -> dict:
+def _click_and_type(x, y, text, press_enter=True, clicks=1):
+    """Click at (x,y) to set focus, then type text, then optionally press Enter.
+    ALL in one call — ensures text goes to the right window."""
     import pyautogui
     pyautogui.FAILSAFE = True
-    cursor = _get_cursor()
-    cursor.show_click(x, y, "Move")
-    pyautogui.moveTo(x, y, duration=duration)
-    return {"success": True, "action": "move", "x": x, "y": y}
+    c = _get_cursor()
 
+    # 1. Move cursor and click to set focus
+    c.show_click(x, y, f"Click -> Type")
+    time.sleep(0.15)
+    pyautogui.moveTo(x, y, duration=0.3)
+    pyautogui.click(x=x, y=y, button="left", clicks=clicks)
+    time.sleep(0.5)  # wait for focus shift
 
-def _type_text(text: str, interval: float = 0.02,
-               x: int | None = None, y: int | None = None,
-               clicks: int = 1, press_enter: bool = False) -> dict:
-    """Type text. If (x,y) given, clicks there first to establish focus.
-    Uses clipboard+Ctrl+V for non-ASCII text.
-    If press_enter=True, presses Enter after typing IN THE SAME CALL
-    (so the target window still has focus)."""
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    cursor = _get_cursor()
-
-    if x is not None and y is not None:
-        cursor.show_click(x, y, "Click -> Type")
-        time.sleep(0.15)
-        pyautogui.moveTo(x, y, duration=0.3)
-        pyautogui.click(x=x, y=y, button="left", clicks=clicks)
-        time.sleep(0.4)
-
-    has_non_ascii = any(ord(c) > 127 for c in text)
-    cursor.show_type(text)
+    # 2. Type text
+    has_non_ascii = any(ord(ch) > 127 for ch in text)
+    c.show_type(text)
 
     if has_non_ascii:
         import pyperclip
@@ -367,91 +230,55 @@ def _type_text(text: str, interval: float = 0.02,
         pyautogui.hotkey('ctrl', 'v')
         time.sleep(0.2)
     else:
-        pyautogui.typewrite(text, interval=interval)
+        pyautogui.typewrite(text, interval=0.02)
 
+    # 3. Press Enter if requested
     if press_enter:
         time.sleep(0.15)
         pyautogui.press('enter')
 
-    return {"success": True, "action": "type", "text": text,
-            "length": len(text), "used_clipboard": has_non_ascii,
-            "pressed_enter": press_enter}
+    return {"success": True, "action": "click_and_type", "x": x, "y": y,
+            "text": text, "length": len(text),
+            "used_clipboard": has_non_ascii, "pressed_enter": press_enter}
 
-
-def _key_press(keys: str,
-               x: int | None = None, y: int | None = None) -> dict:
-    """Press a key/combo. If (x,y) given, clicks there first so the
-    key press goes to the right window (not Claude Desktop)."""
+def _key_press(keys, x=None, y=None):
+    """Press a key/combo. If (x,y) given, clicks there first."""
     import pyautogui
     pyautogui.FAILSAFE = True
-
     if x is not None and y is not None:
-        cursor = _get_cursor()
-        cursor.show_click(x, y, f"Click -> {keys}")
-        time.sleep(0.15)
-        pyautogui.moveTo(x, y, duration=0.3)
+        c = _get_cursor(); c.show_click(x, y, f"Click -> {keys}")
+        time.sleep(0.15); pyautogui.moveTo(x, y, duration=0.3)
         pyautogui.click(x=x, y=y, button="left", clicks=1)
         time.sleep(0.4)
-
     parts = [k.strip() for k in keys.split("+")]
-    if len(parts) == 1:
-        pyautogui.press(parts[0])
-    else:
-        pyautogui.hotkey(*parts)
+    if len(parts) == 1: pyautogui.press(parts[0])
+    else: pyautogui.hotkey(*parts)
     return {"success": True, "action": "key_press", "keys": parts}
 
-
-def _scroll(x: int, y: int, direction: str = "down", amount: int = 3) -> dict:
+def _scroll(x, y, direction="down", amount=3):
     import pyautogui
     pyautogui.FAILSAFE = True
-    cursor = _get_cursor()
-    cursor.show_click(x, y, f"Scroll {direction}")
-    time.sleep(0.1)
-    pyautogui.moveTo(x, y, duration=0.2)
-    delta = amount if direction == "down" else -amount
-    pyautogui.scroll(delta, x=x, y=y)
-    cursor.show_scroll(direction, amount)
-    return {"success": True, "action": "scroll", "x": x, "y": y,
-            "direction": direction, "amount": amount}
+    c = _get_cursor(); c.show_click(x, y, f"Scroll {direction}")
+    time.sleep(0.1); pyautogui.moveTo(x, y, duration=0.2)
+    pyautogui.scroll(amount if direction == "down" else -amount, x=x, y=y)
+    return {"success": True, "action": "scroll", "x": x, "y": y}
 
-
-def _drag(start_x: int, start_y: int, end_x: int, end_y: int, duration: float = 0.5) -> dict:
+def _drag(sx, sy, ex, ey, duration=0.5):
     import pyautogui
     pyautogui.FAILSAFE = True
-    cursor = _get_cursor()
-    cursor.show_drag(start_x, start_y, end_x, end_y)
-    time.sleep(0.1)
-    pyautogui.moveTo(start_x, start_y, duration=0.3)
-    pyautogui.drag(end_x - start_x, end_y - start_y, duration=duration)
-    return {"success": True, "action": "drag",
-            "start_x": start_x, "start_y": start_y,
-            "end_x": end_x, "end_y": end_y}
+    c = _get_cursor(); c.show_drag(sx, sy, ex, ey) if hasattr(c, 'show_drag') else None
+    time.sleep(0.1); pyautogui.moveTo(sx, sy, duration=0.3)
+    pyautogui.drag(ex-sx, ey-sy, duration=duration)
+    return {"success": True, "action": "drag"}
 
+def _wait(d=1.0):
+    time.sleep(d); return {"success": True}
 
-def _wait(duration: float = 1.0) -> dict:
-    time.sleep(duration)
-    return {"success": True, "action": "wait", "duration": duration}
-
-
-def _open_app(name: str) -> dict:
-    """Open an application by name via subprocess (most reliable method).
-    This bypasses keyboard focus issues entirely."""
-    # Common app launch commands
-    if name.lower() in ("edge", "microsoft edge"):
-        cmd = "start microsoft-edge:"
-    elif name.lower() in ("brave",):
-        cmd = "start brave"
-    elif name.lower() in ("chrome", "google chrome"):
-        cmd = "start chrome"
-    elif name.lower() in ("firefox",):
-        cmd = "start firefox"
-    elif name.lower() in ("notepad",):
-        cmd = "start notepad"
-    elif name.lower() in ("calc", "calculator"):
-        cmd = "start calc"
-    else:
-        cmd = f"start {name}"
-
+def _open_app(name):
+    mapping = {"edge": "start microsoft-edge:", "brave": "start brave",
+               "chrome": "start chrome", "firefox": "start firefox",
+               "notepad": "start notepad", "calc": "start calc"}
+    cmd = mapping.get(name.lower(), f"start {name}")
     try:
         subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return {"success": True, "action": "open_app", "app": name}
@@ -459,9 +286,9 @@ def _open_app(name: str) -> dict:
         return {"success": False, "action": "open_app", "app": name, "error": str(e)}
 
 
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 #  MCP Server
-# ═══════════════════════════════════════════════════════════════
+# ════════════════════════════════════════
 
 app = Server("computer-use")
 
@@ -469,203 +296,154 @@ app = Server("computer-use")
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
-        Tool(name="screenshot", description="Capture the current screen. Returns a base64-encoded PNG image so you can see what's on screen. Use this to observe the current state before deciding what to do.",
+        Tool(name="screenshot",
+             description="Take a screenshot of the current screen. Returns the image. EXAMINE the image carefully, estimate pixel coordinates of UI elements you want to interact with, then use click_and_type with those coordinates.",
              inputSchema={"type": "object", "properties": {"monitor": {"type": "integer", "default": 0}}}),
 
-        Tool(name="get_screen_size", description="Get screen dimensions (width x height) in pixels.",
-             inputSchema={"type": "object", "properties": {}, "required": []}),
-        Tool(name="get_display_info", description="Get information about all connected displays.",
-             inputSchema={"type": "object", "properties": {}, "required": []}),
-        Tool(name="get_mouse_position", description="Get current mouse cursor coordinates.",
+        Tool(name="get_screen_size",
+             description="Get screen width and height in pixels.",
              inputSchema={"type": "object", "properties": {}, "required": []}),
 
-        Tool(name="mouse_move", description="Move the mouse smoothly to (x,y). The virtual cursor shows the movement.",
-             inputSchema={"type": "object", "properties": {
-                 "x": {"type": "integer"}, "y": {"type": "integer"},
-                 "duration": {"type": "number", "default": 0.35},
-             }, "required": ["x", "y"]}),
+        Tool(name="get_mouse_position",
+             description="Get current mouse (x,y) position.",
+             inputSchema={"type": "object", "properties": {}, "required": []}),
 
-        Tool(name="click", description="""Click at (x,y). A red virtual cursor appears at the click position with a ripple effect.
-After clicking, the tool CAPTURES A NEW SCREENSHOT and checks if the click had any visual effect.
-Returns: 'changed' (true/false), 'change_ratio' (%), and the new screenshot.
-If changed=false, the click missed — adjust coordinates and retry.""",
-             inputSchema={"type": "object", "properties": {
-                 "x": {"type": "integer", "description": "Horizontal pixel coordinate"}, "y": {"type": "integer"},
-                 "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
-                 "clicks": {"type": "integer", "enum": [1, 2], "default": 1},
-             }, "required": ["x", "y"]}),
+        Tool(name="click",
+             description="Click the left mouse button at (x,y). Returns after-screenshot + whether screen changed. Use this to give focus to a window or button — then follow up with click_and_type to type in it.",
+             inputSchema={"type": "object",
+                          "properties": {"x": {"type": "integer"}, "y": {"type": "integer"},
+                                         "clicks": {"type": "integer", "enum": [1, 2], "default": 1}},
+                          "required": ["x", "y"]}),
 
-        Tool(name="type_text", description="""Type text. Uses clipboard+Ctrl+V for Chinese/emoji automatically.
-Provide (x,y) to CLICK on the target input field FIRST — this ensures the text goes to the right window.
-Set press_enter=true to submit the text (e.g. search, send message).
-After typing, returns a new screenshot and whether the screen changed.
-Example: type_text(text='你好', x=500, y=60, press_enter=true)""",
-             inputSchema={"type": "object", "properties": {
-                 "text": {"type": "string", "description": "Text to type (Chinese/emoji OK)"},
-                 "x": {"type": "integer", "description": "Click X before typing (to focus target)"},
-                 "y": {"type": "integer", "description": "Click Y before typing"},
-                 "clicks": {"type": "integer", "enum": [1, 2], "default": 1},
-                 "press_enter": {"type": "boolean", "default": False, "description": "Press Enter after typing (in same call, focus preserved)"},
-                 "interval": {"type": "number", "default": 0.02},
-             }, "required": ["text"]}),
+        Tool(name="click_and_type",
+             description="THE MAIN TEXT INPUT TOOL. Click at (x,y) to focus, then type text, then press Enter. All in one call. ALWAYS use this instead of separate click+type — it ensures text reaches the right window. Supports Chinese/emoji via clipboard. Example: click_and_type(x=400, y=60, text='douyin.com')",
+             inputSchema={"type": "object",
+                          "properties": {
+                              "x": {"type": "integer", "description": "X pixel coordinate of the text input field"},
+                              "y": {"type": "integer", "description": "Y pixel coordinate of the text input field"},
+                              "text": {"type": "string", "description": "Text to type (Chinese OK)"},
+                              "press_enter": {"type": "boolean", "default": True,
+                                              "description": "Press Enter after typing"},
+                              "clicks": {"type": "integer", "enum": [1, 2], "default": 1},
+                          }, "required": ["x", "y", "text"]}),
 
-        Tool(name="key_press", description="""Press a key or combo. Provide (x,y) to click first so the key goes to the right window.
-Example: key_press(keys='enter', x=500, y=300) — clicks at (500,300) then presses Enter.""",
-             inputSchema={"type": "object", "properties": {
-                 "keys": {"type": "string", "description": "Key or combo like 'enter', 'ctrl+v'"},
-                 "x": {"type": "integer", "description": "Click X first (to focus target window)"},
-                 "y": {"type": "integer", "description": "Click Y first"},
-             }, "required": ["keys"]}),
+        Tool(name="key_press",
+             description="Press a key or combination like 'enter', 'ctrl+v', 'ctrl+l'. Provide (x,y) to click on the target window first so the key goes there.",
+             inputSchema={"type": "object",
+                          "properties": {
+                              "keys": {"type": "string", "description": "Key like 'enter', 'ctrl+v'"},
+                              "x": {"type": "integer"}, "y": {"type": "integer"},
+                          }, "required": ["keys"]}),
 
-        Tool(name="scroll", description="Scroll at (x,y). Shows virtual cursor, captures after-screenshot with change detection.",
-             inputSchema={"type": "object", "properties": {
-                 "x": {"type": "integer"}, "y": {"type": "integer"},
-                 "direction": {"type": "string", "enum": ["up", "down"], "default": "down"},
-                 "amount": {"type": "integer", "default": 3},
-             }, "required": ["x", "y"]}),
+        Tool(name="scroll",
+             description="Scroll the mouse wheel at (x,y).",
+             inputSchema={"type": "object",
+                          "properties": {"x": {"type": "integer"}, "y": {"type": "integer"},
+                                         "direction": {"type": "string", "enum": ["up", "down"], "default": "down"},
+                                         "amount": {"type": "integer", "default": 3}},
+                          "required": ["x", "y"]}),
 
-        Tool(name="drag", description="Drag from (start_x,start_y) to (end_x,end_y). Shows a visual line. Captures after-screenshot.",
-             inputSchema={"type": "object", "properties": {
-                 "start_x": {"type": "integer"}, "start_y": {"type": "integer"},
-                 "end_x": {"type": "integer"}, "end_y": {"type": "integer"},
-                 "duration": {"type": "number", "default": 0.5},
-             }, "required": ["start_x", "start_y", "end_x", "end_y"]}),
+        Tool(name="drag",
+             description="Drag from (start_x,start_y) to (end_x,end_y).",
+             inputSchema={"type": "object",
+                          "properties": {"start_x": {"type": "integer"}, "start_y": {"type": "integer"},
+                                         "end_x": {"type": "integer"}, "end_y": {"type": "integer"},
+                                         "duration": {"type": "number", "default": 0.5}},
+                          "required": ["start_x", "start_y", "end_x", "end_y"]}),
 
-        Tool(name="wait", description="Pause for a duration. Use between actions.",
+        Tool(name="wait",
+             description="Pause. Use between actions for UI to respond.",
              inputSchema={"type": "object", "properties": {"duration": {"type": "number", "default": 1.0}}}),
 
-        Tool(name="open_app", description="""Open an application by name. Uses direct process launch (most reliable, no keyboard simulation needed).
-Supported names: edge, brave, chrome, firefox, notepad, calc, settings.""",
-             inputSchema={"type": "object", "properties": {
-                 "name": {"type": "string", "description": "App name: edge, brave, chrome, firefox, notepad, calc, settings"},
-             }, "required": ["name"]}),
+        Tool(name="open_app",
+             description="Open an application by name: edge, brave, chrome, firefox, notepad, calc. Returns a screenshot after the app opens.",
+             inputSchema={"type": "object",
+                          "properties": {"name": {"type": "string", "description": "App name"}},
+                          "required": ["name"]}),
     ]
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
+async def call_tool(name: str, args: dict[str, Any]) -> list[TextContent | ImageContent]:
     try:
-        # ─── Read-only tools ───────────────────────
-
         if name == "screenshot":
-            r = await asyncio.to_thread(_capture_screen, arguments.get("monitor", 0))
-            status = _get_cursor()
-            status.set_status("Screenshot captured")
+            r = await asyncio.to_thread(_screenshot, args.get("monitor", 0))
             return [
-                TextContent(type="text", text=f"Screen: {r['width']}x{r['height']} (monitor {r['monitor']})\nLook at this screenshot and decide the next action. Estimate pixel coordinates of what you want to click."),
-                ImageContent(type="image", data=r["data"], mimeType="image/png"),
-            ]
+                TextContent(type="text",
+                            text=f"Screen: {r['width']}x{r['height']}.\n"
+                                 "This is your current desktop. Look at the image carefully.\n"
+                                 f"Coordinates: top-left=(0,0), center=({r['width']//2},{r['height']//2}), "
+                                 f"bottom-right=({r['width']},{r['height']})."),
+                ImageContent(type="image", data=r["data"], mimeType="image/png")]
 
         elif name == "get_screen_size":
             r = await asyncio.to_thread(_screen_size)
-            return [TextContent(type="text", text=f"{r['width']} x {r['height']}")]
-
-        elif name == "get_display_info":
-            r = await asyncio.to_thread(_get_display_info)
-            lines = [f"Disp {d['index']}: {d['width']}x{d['height']} at ({d['x']},{d['y']}){' [PRIMARY]' if d['is_primary'] else ''}" for d in r]
-            return [TextContent(type="text", text="\n".join(lines))]
+            return [TextContent(type="text", text=f"{r['width']}x{r['height']}")]
 
         elif name == "get_mouse_position":
-            r = await asyncio.to_thread(_current_mouse_position)
+            r = await asyncio.to_thread(_mouse_pos)
             return [TextContent(type="text", text=f"({r['x']}, {r['y']})")]
 
-        # ─── Actions with screenshot feedback ──────
-
-        elif name == "mouse_move":
-            r = await asyncio.to_thread(_action_with_feedback, _mouse_move,
-                                        arguments["x"], arguments["y"],
-                                        arguments.get("duration", 0.35))
-            c = r["changed"]
-            return [
-                TextContent(type="text", text=f"Mouse moved to ({arguments['x']},{arguments['y']}). Screen changed: {c} ({r['change_ratio']}%)"),
-                ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png"),
-            ]
-
         elif name == "click":
-            r = await asyncio.to_thread(_action_with_feedback, _mouse_click,
-                                        arguments["x"], arguments["y"],
-                                        arguments.get("button", "left"),
-                                        arguments.get("clicks", 1))
-            b = arguments.get("button", "left")
-            c = arguments.get("clicks", 1)
-            label = f"{'Double-' if c == 2 else ''}{b}-click"
-            ch = "YES" if r["changed"] else "NO"
-            hint = "" if r["changed"] else "\nNo visual change detected — the click may have missed the target. Try adjusting coordinates slightly."
-            return [
-                TextContent(type="text", text=f"{label} at ({arguments['x']},{arguments['y']}). Changed: {ch} ({r['change_ratio']}% pixels){hint}"),
-                ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png"),
-            ]
+            r = await asyncio.to_thread(_action_with_feedback, _click,
+                                        args["x"], args["y"], "left", args.get("clicks", 1))
+            ch = "CHANGED" if r["changed"] else "NO CHANGE"
+            hint = "" if r["changed"] else " Click missed target — retry with adjusted coordinates."
+            return [TextContent(type="text", text=f"Click ({args['x']},{args['y']}): {ch} ({r['change_ratio']}%).{hint}"),
+                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
 
-        elif name == "type_text":
-            text = arguments["text"]
-            cx = arguments.get("x")
-            cy = arguments.get("y")
-            cl = arguments.get("clicks", 1)
-            pe = arguments.get("press_enter", False)
-            r = await asyncio.to_thread(_action_with_feedback, _type_text,
-                                        text, arguments.get("interval", 0.02),
-                                        cx, cy, cl, pe)
-            ch = "YES" if r["changed"] else "NO"
-            clip = " (clipboard)" if r.get("used_clipboard", False) else ""
-            ctx = f" (clicked ({cx},{cy}) first)" if cx is not None else ""
-            ent = " + Enter" if pe else ""
-            return [
-                TextContent(type="text", text=f"Typed {len(text)} chars{clip}{ent}{ctx}. Changed: {ch} ({r['change_ratio']}%)"),
-                ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png"),
-            ]
+        elif name == "click_and_type":
+            r = await asyncio.to_thread(_action_with_feedback, _click_and_type,
+                                        args["x"], args["y"], args["text"],
+                                        args.get("press_enter", True), args.get("clicks", 1))
+            ch = "CHANGED" if r["changed"] else "NO CHANGE"
+            ent = "+Enter" if r.get("pressed_enter") else ""
+            clip = " (clipboard)" if r.get("used_clipboard") else ""
+            hint = "" if r["changed"] else " MISSED — check coordinates and retry."
+            return [TextContent(type="text",
+                                text=f"click_and_type ({args['x']},{args['y']}): "
+                                     f"'{args['text'][:50]}'{clip}{ent} -> {ch} ({r['change_ratio']}%).{hint}"),
+                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
 
         elif name == "key_press":
-            kx = arguments.get("x")
-            ky = arguments.get("y")
-            r = await asyncio.to_thread(_action_with_feedback, _key_press,
-                                        arguments["keys"], kx, ky)
-            ch = "YES" if r["changed"] else "NO"
+            kx, ky = args.get("x"), args.get("y")
+            r = await asyncio.to_thread(_action_with_feedback, _key_press, args["keys"], kx, ky)
+            ch = "CHANGED" if r["changed"] else "NO CHANGE"
             ctx = f" (clicked ({kx},{ky}) first)" if kx is not None else ""
-            return [
-                TextContent(type="text", text=f"Pressed {arguments['keys']}{ctx}. Changed: {ch} ({r['change_ratio']}%)"),
-                ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png"),
-            ]
+            return [TextContent(type="text", text=f"Key {args['keys']}{ctx}: {ch} ({r['change_ratio']}%)."),
+                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
 
         elif name == "scroll":
             r = await asyncio.to_thread(_action_with_feedback, _scroll,
-                                        arguments["x"], arguments["y"],
-                                        arguments.get("direction", "down"),
-                                        arguments.get("amount", 3))
-            ch = "YES" if r["changed"] else "NO"
-            return [
-                TextContent(type="text", text=f"Scrolled {arguments.get('direction','down')} at ({arguments['x']},{arguments['y']}). Changed: {ch} ({r['change_ratio']}%)"),
-                ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png"),
-            ]
+                                        args["x"], args["y"],
+                                        args.get("direction", "down"), args.get("amount", 3))
+            ch = "CHANGED" if r["changed"] else "NO CHANGE"
+            return [TextContent(type="text", text=f"Scroll ({args['x']},{args['y']}): {ch} ({r['change_ratio']}%)."),
+                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
 
         elif name == "drag":
             r = await asyncio.to_thread(_action_with_feedback, _drag,
-                                        arguments["start_x"], arguments["start_y"],
-                                        arguments["end_x"], arguments["end_y"],
-                                        arguments.get("duration", 0.5))
-            ch = "YES" if r["changed"] else "NO"
-            return [
-                TextContent(type="text", text=f"Dragged ({arguments['start_x']},{arguments['start_y']})→({arguments['end_x']},{arguments['end_y']}). Changed: {ch}"),
-                ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png"),
-            ]
+                                        args["start_x"], args["start_y"],
+                                        args["end_x"], args["end_y"], args.get("duration", 0.5))
+            ch = "CHANGED" if r["changed"] else "NO CHANGE"
+            return [TextContent(type="text", text=f"Drag: {ch} ({r['change_ratio']}%)."),
+                    ImageContent(type="image", data=r["after_screenshot"], mimeType="image/png")]
 
         elif name == "wait":
-            d = min(arguments.get("duration", 1.0), 10.0)
-            await asyncio.to_thread(_wait, d)
-            return [TextContent(type="text", text=f"Waited {d}s")]
-
-        # ─── App launcher ─────────────────────────
+            await asyncio.to_thread(_wait, min(args.get("duration", 1.0), 10.0))
+            return [TextContent(type="text", text=f"Waited {args.get('duration', 1.0)}s")]
 
         elif name == "open_app":
-            r = await asyncio.to_thread(_open_app, arguments["name"])
+            r = await asyncio.to_thread(_open_app, args["name"])
             if r["success"]:
-                _wait(2.0)  # wait for app to open
-                ss = _capture_screen(0)
-                _get_cursor().set_status(f"Opened {arguments['name']}")
-                return [
-                    TextContent(type="text", text=f"Opened '{arguments['name']}'. Here's the current screen:"),
-                    ImageContent(type="image", data=ss["data"], mimeType="image/png"),
-                ]
-            return [TextContent(type="text", text=f"Failed to open '{arguments['name']}': {r.get('error', 'unknown')}")]
+                _wait(2.0)
+                ss = _screenshot(0)
+                _get_cursor().set_status(f"Opened {args['name']}")
+                return [TextContent(type="text",
+                                    text=f"Opened '{args['name']}'. Current screen below. "
+                                         "Now call screenshot() to see the app, then use click_and_type() to type."),
+                        ImageContent(type="image", data=ss["data"], mimeType="image/png")]
+            return [TextContent(type="text", text=f"FAILED to open '{args['name']}': {r.get('error')}")]
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
@@ -676,16 +454,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
 
 
 async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
-
+    async with stdio_server() as (r, w):
+        await app.run(r, w, app.create_initialization_options())
 
 def run():
     logging.basicConfig(level=logging.WARNING)
-    # Start the virtual cursor
     _get_cursor()
     asyncio.run(main())
-
 
 if __name__ == "__main__":
     run()
