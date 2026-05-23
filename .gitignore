@@ -30,6 +30,7 @@ Thumbs.db
 # Project
 logs/
 recordings/
+test_output.txt
 
 # Config overrides
 config/local.yaml
