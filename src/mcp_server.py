@@ -46,7 +46,7 @@ def _load_config() -> dict:
     # Read .env file
     env_path = Path(__file__).parent.parent / ".env"
     if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").readlines():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
@@ -81,7 +81,7 @@ Available actions:
 1. Click: {"action": "click", "x": <int>, "y": <int>, "button": "left"}
 2. Double-click: {"action": "double_click", "x": <int>, "y": <int>}
 3. Type text: {"action": "type", "text": "<string>"}
-4. Press a key: {"action": "key", "keys": "<key>"}  (e.g. "enter", "tab", "ctrl+v", "ctrl+l")
+4. Press a key: {"action": "key", "keys": "enter"}  or  {"action": "key", "keys": "ctrl+v"}  (use + for combos)
 5. Scroll: {"action": "scroll", "x": <int>, "y": <int>, "direction": "up|down", "amount": <int>}
 6. Drag: {"action": "drag", "start_x": <int>, "start_y": <int>, "end_x": <int>, "end_y": <int>}
 7. Wait: {"action": "wait", "duration": <float>}
@@ -244,9 +244,45 @@ def _type(text):
 def _key(keys):
     import pyautogui
     pyautogui.FAILSAFE = True
-    parts = [k.strip() for k in keys.split("+")]
-    if len(parts) == 1: pyautogui.press(parts[0])
-    else: pyautogui.hotkey(*parts)
+
+    # Normalize: handle both string "ctrl+v" and list ["ctrl","v"]
+    if isinstance(keys, list):
+        parts = [str(k).strip().lower() for k in keys]
+    else:
+        parts = [k.strip().lower() for k in str(keys).split("+")]
+
+    # Win key combos need system-level events via Win32 API
+    if "win" in parts or "lwin" in parts or "rwin" in parts:
+        import ctypes
+        VK_MAP = {"win": 0x5B, "lwin": 0x5B, "rwin": 0x5C,
+                  "a": 0x41, "b": 0x42, "c": 0x43, "d": 0x44, "e": 0x45,
+                  "f": 0x46, "g": 0x47, "h": 0x48, "i": 0x49, "j": 0x4A,
+                  "k": 0x4B, "l": 0x4C, "m": 0x4D, "n": 0x4E, "o": 0x4F,
+                  "p": 0x50, "q": 0x51, "r": 0x52, "s": 0x53, "t": 0x54,
+                  "u": 0x55, "v": 0x56, "w": 0x57, "x": 0x58, "y": 0x59, "z": 0x5A,
+                  "0": 0x30, "1": 0x31, "2": 0x32, "3": 0x33, "4": 0x34,
+                  "5": 0x35, "6": 0x36, "7": 0x37, "8": 0x38, "9": 0x39,
+                  "enter": 0x0D, "tab": 0x09, "escape": 0x1B, "space": 0x20,
+                  "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28}
+        KEYEVENTF_KEYUP = 0x0002
+        for k in parts:
+            vk = VK_MAP.get(k, 0)
+            if vk:
+                ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+                time.sleep(0.02)
+        # Release in reverse
+        for k in reversed(parts):
+            vk = VK_MAP.get(k, 0)
+            if vk:
+                time.sleep(0.02)
+                ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+        return
+
+    # Regular keys via pyautogui
+    if len(parts) == 1:
+        pyautogui.press(parts[0])
+    else:
+        pyautogui.hotkey(*parts)
 
 def _scroll(x, y, direction="down", amount=3):
     import pyautogui
@@ -278,7 +314,8 @@ def _open_app(name):
 # ═════════════════════════════════════════════════════════════
 
 def _call_ai(messages: list) -> str | None:
-    """Send conversation to the configured model via OpenAI-compatible API."""
+    """Send conversation to the configured model via OpenAI-compatible API.
+    Retries on rate limit with exponential backoff."""
     from openai import OpenAI
 
     if not _AI_API_KEY:
@@ -286,17 +323,25 @@ def _call_ai(messages: list) -> str | None:
 
     client = OpenAI(base_url=_AI_BASE_URL, api_key=_AI_API_KEY)
 
-    try:
-        response = client.chat.completions.create(
-            model=_AI_MODEL,
-            messages=messages,
-            max_tokens=1024,
-            temperature=0.0,
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logger.error("AI call failed: %s", e)
-        return None
+    for attempt in range(5):
+        try:
+            response = client.chat.completions.create(
+                model=_AI_MODEL,
+                messages=messages,
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
+                wait_time = min(2 ** attempt, 30)
+                logger.warning("Rate limited, retrying in %ds...", wait_time)
+                time.sleep(wait_time)
+                continue
+            logger.error("AI call failed: %s", e)
+            return None
+    return None
 
 
 def _parse_action(raw: str) -> dict | None:
@@ -374,42 +419,74 @@ def _run_task(task: str, max_iterations: int = 30) -> dict:
                     "iterations": i + 1, "actions": actions_log,
                     "last_screenshot": last_b64}
 
-        # Execute the action
+        # Validate action before executing
         desc = ""
         try:
-            if a == "click":
-                _click(action.get("x", 0), action.get("y", 0),
-                       action.get("button", "left"), 1)
-                desc = f"Click ({action['x']},{action['y']})"
-            elif a == "double_click":
-                _click(action.get("x", 0), action.get("y", 0), "left", 2)
-                desc = f"Double-click ({action['x']},{action['y']})"
+            if a in ("click", "double_click"):
+                # Extract coordinates — handle all formats models might use:
+                #   {"x": 100, "y": 200}, {"x": [165,30]}, {"coordinate": [100,200]},
+                #   {"x": [100], "y": [200]}, {"position": [100,200]}
+                x_raw = action.get("x"); y_raw = action.get("y")
+                coord_raw = action.get("coordinate") or action.get("coordinates") or action.get("position")
+
+                # Case 1: {"x": [165, 30]} — x is a 2-element coordinate array
+                if isinstance(x_raw, (list, tuple)) and len(x_raw) >= 2 and y_raw is None:
+                    x, y = int(x_raw[0]), int(x_raw[1])
+                # Case 2: {"coordinate": [100, 200]}
+                elif coord_raw and isinstance(coord_raw, (list, tuple)) and len(coord_raw) >= 2:
+                    x, y = int(coord_raw[0]), int(coord_raw[1])
+                # Case 3: {"x": 100, "y": 200} or {"x": [100], "y": [200]}
+                elif x_raw is not None and y_raw is not None:
+                    x = int(x_raw[0]) if isinstance(x_raw, list) and x_raw else int(x_raw)
+                    y = int(y_raw[0]) if isinstance(y_raw, list) and y_raw else int(y_raw)
+                else:
+                    raise ValueError(f"Bad coordinates: x={x_raw}, y={y_raw}, coord={coord_raw}")
+                clk = 2 if a == "double_click" else 1
+                btn = action.get("button", "left")
+                _click(x, y, btn if btn in ("left","right","middle") else "left", clk)
+                desc = f"Click ({x},{y})"
+
             elif a == "type":
                 _type(action.get("text", ""))
-                desc = f"Type: '{action['text'][:30]}'"
+                desc = f"Type: '{str(action.get('text',''))[:30]}'"
+
             elif a == "key":
                 _key(action.get("keys", ""))
-                desc = f"Key: {action['keys']}"
+                desc = f"Key: {action.get('keys','')}"
+
             elif a == "scroll":
-                _scroll(action.get("x", 0), action.get("y", 0),
-                        action.get("direction", "down"), action.get("amount", 3))
+                x = action.get("x", 0); y = action.get("y", 0)
+                if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                    raise ValueError(f"Invalid scroll coordinates: {x}, {y}")
+                _scroll(int(x), int(y), action.get("direction", "down"), action.get("amount", 3))
                 desc = f"Scroll {action.get('direction','down')}"
+
             elif a == "drag":
-                _drag(action.get("start_x", 0), action.get("start_y", 0),
-                      action.get("end_x", 0), action.get("end_y", 0),
-                      action.get("duration", 0.5))
+                _drag(int(action.get("start_x", 0)), int(action.get("start_y", 0)),
+                      int(action.get("end_x", 0)), int(action.get("end_y", 0)),
+                      float(action.get("duration", 0.5)))
                 desc = "Drag"
+
             elif a == "wait":
-                _wait(min(action.get("duration", 1.0), 10.0))
+                _wait(min(float(action.get("duration", 1.0)), 10.0))
                 desc = f"Wait {action.get('duration',1)}s"
+
             else:
-                desc = f"Unknown action: {a}"
+                desc = f"Unknown: {a}"
+
             actions_log.append(desc)
             logger.info("Step %d: %s", i+1, desc)
+
         except Exception as e:
             logger.error("Action failed: %s", e)
             desc = f"Error: {e}"
             actions_log.append(desc)
+            # Tell the model the action failed so it can try a different approach
+            messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
+            messages.append({"role": "user", "content": [
+                {"type": "text", "text": f"Error executing that action: {e}. Try a different approach or adjust the action format."}
+            ]})
+            continue
 
         # Wait for UI, capture new screenshot
         time.sleep(0.8)
