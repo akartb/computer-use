@@ -72,31 +72,34 @@ _AI_BASE_URL = _config.get("COMPUTER_USE_BASE_URL", _config.get("OPENAI_BASE_URL
 #  System prompt — tells any vision model how to output actions
 # ═════════════════════════════════════════════════════════════
 
-_SYSTEM_PROMPT = """You are a computer use agent. You control a computer by looking at screenshots and deciding where to click and what to type.
+_SYSTEM_PROMPT = """You are a computer use agent. Control the computer by looking at screenshots and deciding exactly where to click and what to type.
 
-When you see a screenshot, decide the NEXT SINGLE ACTION to advance the task. Output ONLY a JSON object with no additional text, no markdown, no explanation.
+The screenshot HAS A GRID OVERLAY with coordinate labels:
+- Green numbers along the edges show pixel coordinates (every 400px)
+- Faint gray lines every 200px
+- Yellow corner labels show (0,0) at top-left, (W,0) top-right, (0,H) bottom-left, (W,H) bottom-right
+- USE THESE GRID LABELS to estimate exact pixel positions of UI elements
 
-Available actions:
+OUTPUT ONLY a JSON object. No text, no markdown, no explanation.
 
-1. Click: {"action": "click", "x": <int>, "y": <int>, "button": "left"}
-2. Double-click: {"action": "double_click", "x": <int>, "y": <int>}
-3. Type text: {"action": "type", "text": "<string>"}
-4. Press a key: {"action": "key", "keys": "enter"}  or  {"action": "key", "keys": "ctrl+v"}  (use + for combos)
-5. Scroll: {"action": "scroll", "x": <int>, "y": <int>, "direction": "up|down", "amount": <int>}
-6. Drag: {"action": "drag", "start_x": <int>, "start_y": <int>, "end_x": <int>, "end_y": <int>}
-7. Wait: {"action": "wait", "duration": <float>}
-8. Done: {"action": "done", "summary": "<what was accomplished>"}
+Actions:
+1. Click: {"action": "click", "x": 100, "y": 200}
+2. Double-click: {"action": "double_click", "x": 100, "y": 200}
+3. Type text: {"action": "type", "text": "hello"}  (text is sent via clipboard, type EXACTLY what you want)
+4. Press key: {"action": "key", "keys": "enter"} or {"action": "key", "keys": "ctrl+v"}
+5. Scroll: {"action": "scroll", "x": 100, "y": 200, "direction": "down", "amount": 3}
+6. Drag: {"action": "drag", "start_x": 100, "start_y": 200, "end_x": 300, "end_y": 400}
+7. Wait: {"action": "wait", "duration": 2.0}
+8. Done: {"action": "done", "summary": "Completed"}
 
-COORDINATES: (0,0) is the top-left corner of the screen. X increases to the right, Y increases down. Be PRECISE with pixel coordinates — look carefully at where UI elements are positioned.
+IMPORTANT RULES:
+- Read coordinates from the GRID LABELS on the screenshot, not from memory
+- One action per response. Be patient — wait after page loads.
+- For browser: click address bar first, then type URL, then press Enter
+- For search: click the search box first, then type query, then press Enter
+- Type EXACT URLs and text — the system pastes your text via clipboard, so it's exact
 
-TASK FLOW:
-- For opening an app: click on the desktop/taskbar icon, or press Win key and type the app name
-- For browser navigation: click the address bar, type the URL, press Enter
-- For search: click the search box, type the query, press Enter
-- For forms: click each field, type the value
-- Each step: ONE action at a time. Wait for the UI to respond before the next action.
-
-OUTPUT ONLY THE JSON. NO OTHER TEXT."""
+OUTPUT ONLY JSON."""
 
 
 # ═════════════════════════════════════════════════════════════
@@ -205,14 +208,36 @@ def _get_cursor():
     if _cursor is None: _cursor = VirtualCursor(); _cursor.start()
     return _cursor
 
-def _capture_raw(monitor=0):
+def _capture_raw(monitor=0, grid=True):
     import mss
+    from PIL import ImageDraw, ImageFont
     with mss.mss() as sct:
         mons = sct.monitors
         if monitor >= len(mons): monitor = 0
         raw = sct.grab(mons[monitor])
         img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-        buf = io.BytesIO(); img.save(buf, format="PNG")
+
+        # Draw coordinate grid overlay to help the model estimate pixel positions
+        if grid:
+            draw = ImageDraw.Draw(img)
+            w, h = img.size
+            # Grid lines every 200px
+            for x in range(0, w, 200):
+                draw.line([(x, 0), (x, h)], fill=(60, 60, 60), width=1)
+            for y in range(0, h, 200):
+                draw.line([(0, y), (w, y)], fill=(60, 60, 60), width=1)
+            # Coordinate labels at edges
+            for x in range(0, w, 400):
+                draw.text((x + 4, 4), str(x), fill=(100, 200, 100))
+            for y in range(400, h, 400):
+                draw.text((4, y + 4), str(y), fill=(100, 200, 100))
+            # Corner markers
+            draw.text((4, 4), "(0,0)", fill=(255, 255, 100))
+            draw.text((w - 60, 4), f"({w},0)", fill=(255, 255, 100))
+            draw.text((4, h - 20), f"(0,{h})", fill=(255, 255, 100))
+            draw.text((w - 80, h - 20), f"({w},{h})", fill=(255, 255, 100))
+
+        buf = io.BytesIO(); img.save(buf, format="PNG", optimize=True)
         return img, base64.b64encode(buf.getvalue()).decode("utf-8"), img.size
 
 def _screenshot(monitor=0):
@@ -235,11 +260,13 @@ def _type(text):
     import pyautogui
     pyautogui.FAILSAFE = True
     _get_cursor().set_status(f"Typing: {text[:30]}")
-    if any(ord(c) > 127 for c in text):
-        import pyperclip; pyperclip.copy(text); time.sleep(0.08)
-        pyautogui.hotkey('ctrl', 'v'); time.sleep(0.15)
-    else:
-        pyautogui.typewrite(text, interval=0.02)
+    # ALWAYS use clipboard+Ctrl+V — avoids Chinese IME converting
+    # "douyin" into "痘印" and other keyboard-layout issues
+    import pyperclip
+    pyperclip.copy(text)
+    time.sleep(0.08)
+    pyautogui.hotkey('ctrl', 'v')
+    time.sleep(0.15)
 
 def _key(keys):
     import pyautogui
@@ -387,7 +414,7 @@ def _run_task(task: str, max_iterations: int = 30) -> dict:
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": [
-            {"type": "text", "text": f"Task: {task}\n\nScreen size: {w}x{h} pixels.\n\nHere is the first screenshot. What is the first action? Reply with ONLY the JSON action."},
+            {"type": "text", "text": f"Task: {task}\n\nScreen: {w}x{h}px. Green numbers are pixel coordinates. Gray lines every 200px.\nUse the grid labels to estimate exact coordinates. What is the first action? JSON only."},
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
         ]},
     ]
@@ -496,7 +523,7 @@ def _run_task(task: str, max_iterations: int = 30) -> dict:
         # Add to conversation
         messages.append({"role": "assistant", "content": json.dumps(action, ensure_ascii=False)})
         messages.append({"role": "user", "content": [
-            {"type": "text", "text": f"Here is the updated screen after '{desc}'. What is the next action? Output ONLY the JSON action."},
+            {"type": "text", "text": f"After '{desc}'. Screenshot has grid coordinates. Next action? JSON only."},
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
         ]})
 
